@@ -348,6 +348,9 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
           } else if (kind > 6.5 && kind < 7.5) {
             // floodlit open-frame structures
             col += alb * vec3(1.0, 0.6, 0.22) * 2.4 * night * mix(0.5, 1.0, ao);
+          } else if (kind > 7.5 && kind < 8.5) {
+            // engine flame: self-lit
+            col = alb * 2.6;
           }
         }
 

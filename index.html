@@ -31,20 +31,28 @@
       <div id="h-warn">TERRAIN</div>
       <div id="prompt"></div>
       <div id="crosshair"></div>
+      <div id="crash">
+        <div class="crash-card">
+          <h1 id="crash-title">Crashed</h1>
+          <p id="crash-msg"></p>
+          <button id="crash-again" type="button">Fly again</button>
+          <small class="kbd-only">or press Enter</small>
+        </div>
+      </div>
       <div class="panel hidden" id="help">
         <span class="kbd-only">
           <b>Flight</b> W/S pitch · A/D roll · Q/E rudder · Shift/Ctrl (or wheel) throttle · <b>Space</b> brake · drag the mouse to look around<br />
           <b>Take-off</b> full throttle, hold the nose level until ~150 km/h, then ease back (W/S) · don't pull up too hard or the plane stalls<br />
           <b>Landing</b> throttle back, level wings, flare gently just above the runway, then <b>Space</b> to brake and <b>Enter</b> to step out<br />
           <b>On foot</b> click to look · WASD move · Shift sprint · Space jump · <b>Enter</b> board plane (when close) · P call plane<br />
-          <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: WASD steer · <b>Space</b> open parachute · canopy: WASD steer, S flare to land<br />
+          <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: A/D turn, W dive, S slow down · <b>Space</b> open the parachute (it auto-opens low down) · under canopy: A/D steer, W speed bar (faster), S brakes, hold <b>Space</b> to flare just above the ground for a soft landing · mouse looks around<br />
           <b>Camera</b> C chase/cockpit · <b>Time</b> [ ] shift, T pause/resume day cycle (see menu)<br />
           <b>Other</b> G go to place · I invert pitch · L flight assist on/off · H show/hide these controls · Esc/M menu
         </span>
         <span class="touch-only">
           <b>Flight</b> right stick: pitch &amp; roll · left lever: throttle · ◀ ▶ rudder · BRAKE on the ground · drag the sky to look around<br />
           <b>On foot</b> left stick moves · drag to look · JUMP · SPRINT · the round button boards/calls the plane<br />
-          <b>Skydive</b> use the round button to jump from the plane and to open the parachute<br />
+          <b>Skydive</b> round button: jump from the plane, then open the parachute · stick: steer left/right, up = dive / speed, down = brake · hold FLARE just above the ground · drag to look around<br />
           <b>Top right</b> ☰ menu · camera · search · fullscreen
         </span>
       </div>
@@ -66,6 +74,8 @@
           Fly a plane over the whole planet, rebuilt as voxels, land it and explore on foot. Terrain, imagery,
           buildings and water are streamed tile-by-tile as you go.
         </p>
+        <h2>Aircraft</h2>
+        <div id="aircraft"></div>
         <h2>Fly over</h2>
         <div id="presets"></div>
         <h2>Walk around</h2>

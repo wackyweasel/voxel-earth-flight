@@ -175,7 +175,7 @@ function hash3(i, j, k) {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
-function buildBody() {
+export function voxelize(colourAt, ORIGIN, DIMS, VOX) {
   const [nx, ny, nz] = DIMS;
   const grid = new Array(nx * ny * nz).fill(null);
   const idx = (i, j, k) => (k * ny + j) * nx + i;
@@ -275,7 +275,7 @@ function buildProp() {
 
 // One coloured box as an attribute-complete voxel geometry (kind 6 = unlit-by-AO prop material).
 // An optional matrix repositions it, which lets thin boxes act as angled lines.
-export function boxGeometry([x0, x1, y0, y1, z0, z1, c], matrix) {
+export function boxGeometry([x0, x1, y0, y1, z0, z1, c], matrix, kind = 6) {
   const g = new THREE.BoxGeometry(x1 - x0, y1 - y0, z1 - z0);
   g.translate((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
   if (matrix) g.applyMatrix4(matrix);
@@ -284,7 +284,7 @@ export function boxGeometry([x0, x1, y0, y1, z0, z1, c], matrix) {
   for (let i = 0; i < n; i++) col.set(c, i * 3);
   g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
   const aux = new Uint8Array(n * 4);
-  for (let i = 0; i < n; i++) aux.set([6, 255, 0, 0], i * 4);
+  for (let i = 0; i < n; i++) aux.set([kind, 255, 0, 0], i * 4);
   g.setAttribute('aux', new THREE.BufferAttribute(aux, 4));
   g.setAttribute('wuv', new THREE.BufferAttribute(new Float32Array(n * 2), 2));
   g.deleteAttribute('uv');
@@ -294,7 +294,7 @@ export function boxGeometry([x0, x1, y0, y1, z0, z1, c], matrix) {
 
 export function createPlane(material) {
   const group = new THREE.Group();
-  const body = new THREE.Mesh(buildBody(), material);
+  const body = new THREE.Mesh(voxelize(colourAt, ORIGIN, DIMS, VOX), material);
   body.frustumCulled = false;
   const prop = new THREE.Mesh(buildProp(), material);
   prop.frustumCulled = false;

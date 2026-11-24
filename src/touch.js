@@ -36,12 +36,13 @@ export function setMode(mode) {
   if (mode === curMode) return;
   curMode = mode;
   const cl = document.body.classList;
-  cl.remove('m-fly', 'm-walk', 'm-chute');
+  cl.remove('m-fly', 'm-walk', 'm-chute', 'm-crash');
   cl.add(`m-${mode}`);
   touch.stick.x = touch.stick.y = 0;
   touch.rudder = 0;
   touch.brake = false;
   touch.jump = false;
+  $('tb-brake').textContent = mode === 'chute' ? 'FLARE' : 'BRAKE';
   resetKnob();
 }
 

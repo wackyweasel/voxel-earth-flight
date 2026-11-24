@@ -1,10 +1,12 @@
 import * as THREE from 'three';
 import { R, llToDir, llToMerc, dirToLat, dirToLon } from './geo.js';
-import { Flight, TRIM_THROTTLE } from './flight.js';
+import { Flight } from './flight.js';
 import { World } from './world.js';
-import { createPlane, GEAR_DROP } from './plane.js';
+import { createAircraft } from './models.js';
+import { AIRCRAFT, AIRCRAFT_IDS } from './aircraft.js';
 import { Walker } from './walker.js';
 import { Skydiver, HIP } from './skydiver.js';
+import { Effects } from './effects.js';
 import { Shadows } from './shadows.js';
 import { Bloom } from './bloom.js';
 import { env, shared, createVoxelMaterial, createSky, createAtmosphere, createSkyLUT, CLOUD_PERIOD } from './materials.js';
@@ -70,10 +72,20 @@ const world = new World(scene, {
   pxThreshold: QUALITY[DEFAULT_QUALITY],
 });
 
-const plane = createPlane(voxelMat);
+let aircraftId = 'light';
+try {
+  const saved = localStorage.getItem('aircraft');
+  if (AIRCRAFT[saved]) aircraftId = saved;
+} catch (e) {
+  // storage can be blocked; fall back to the default plane
+}
+const models = {};
+const getModel = (id) => (models[id] ??= createAircraft(id, voxelMat));
+let plane = getModel(aircraftId);
 scene.add(plane);
 const diver = new Skydiver(voxelMat);
 scene.add(diver.body, diver.canopy);
+const effects = new Effects(scene, voxelMat);
 
 function resize() {
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -84,8 +96,10 @@ resize();
 
 // --- state ------------------------------------------------------------------
 const flight = new Flight();
+flight.setAircraft(aircraftId);
 const walker = new Walker();
-let mode = 'fly'; // 'fly' | 'walk' | 'chute'
+let mode = 'fly'; // 'fly' | 'walk' | 'chute' | 'crash'
+let crash = null; // wreck being shown after a crash: { kind, t, site, up, az, side, dist, ground, lat, lon, heading, shown }
 let paused = true;
 let planeScale = 1;
 let planeGone = false; // the plane was left behind in the air; P calls it back
@@ -101,6 +115,7 @@ let settle = null; // { t } while waiting for ground tiles to stream in under a 
 let lastUnlock = 0;
 const camQuat = new THREE.Quaternion();
 const chuteGround = { h: 0, water: 0 };
+const chuteInput = { steer: 0, speed: 0, flare: false };
 const NO_INPUT = { pitch: 0, roll: 0, yaw: 0, brake: false };
 const flightInput = { pitch: 0, roll: 0, yaw: 0, brake: false };
 let lookYaw = 0; // free-look offset in fly mode; springs back when released
@@ -125,7 +140,7 @@ function sampleAt(dir) {
 }
 
 function currentLon() {
-  return mode === 'fly' ? flight.lon : mode === 'chute' ? diver.lon : walker.lon;
+  return mode === 'fly' ? flight.lon : mode === 'chute' ? diver.lon : mode === 'crash' ? crash.lon : walker.lon;
 }
 
 const wrap24 = (h) => ((h % 24) + 24) % 24;
@@ -141,6 +156,9 @@ function lockPointer() {
 }
 
 function spawn(p) {
+  applyAircraft();
+  hideCrash();
+  effects.clear();
   if (p.ground) return startOnFoot(p);
   mode = 'fly';
   settle = null;
@@ -148,7 +166,6 @@ function spawn(p) {
   diver.hide();
   document.exitPointerLock?.();
   flight.spawn(p.lat, p.lon, p.alt, p.heading, p.pitch);
-  flight.throttle = TRIM_THROTTLE;
   lookYaw = lookPitch = 0;
   planeScale = Math.max(1, p.alt / 1200);
   sunLon = sunLonFor(p.lon, tod);
@@ -158,7 +175,7 @@ function spawn(p) {
 function startOnFoot(p) {
   flight.spawn(p.lat, p.lon, 0, p.heading, 0);
   flight.stop();
-  flight.throttle = 0;
+  flight.throttle = flight.eng = 0;
   walker.place(_a.copy(flight.p).normalize(), flight.f, 0);
   mode = 'walk';
   settle = { t: 0 };
@@ -169,11 +186,140 @@ function startOnFoot(p) {
   camInit = false;
 }
 
+let wantedAircraft = aircraftId;
+
+// Swaps the plane model and flight model to the one the player picked.
+function applyAircraft() {
+  if (wantedAircraft === aircraftId) return;
+  scene.remove(plane);
+  aircraftId = wantedAircraft;
+  plane = getModel(aircraftId);
+  scene.add(plane);
+  flight.setAircraft(aircraftId);
+}
+
+function syncAircraftButtons() {
+  for (const b of $('aircraft').children) b.classList.toggle('on', b.dataset.id === wantedAircraft);
+}
+
+// Menu pick: takes effect right away on the ground or in the air, and after the next respawn otherwise.
+function chooseAircraft(id) {
+  if (id === wantedAircraft) return;
+  wantedAircraft = id;
+  try {
+    localStorage.setItem('aircraft', id);
+  } catch (e) {
+    // storage can be blocked
+  }
+  syncAircraftButtons();
+  if (mode !== 'fly' && mode !== 'walk') return;
+  const oldDrop = flight.spec.gearDrop;
+  if (mode === 'walk' && (planeGone || settle)) return applyAircraft();
+  const wasNear = mode === 'walk' && nearPlane();
+  if (!flight.grounded && mode === 'fly') {
+    const ground = world.ground.height ?? 0;
+    spawn({ lat: flight.lat, lon: flight.lon, alt: Math.max(flight.alt, ground + 250), heading: flight.headingDeg, pitch: flight.pitchDeg });
+    return;
+  }
+  // parked: put the new plane on its wheels where the old one stood
+  const wheels = flight.alt - oldDrop * planeScale;
+  applyAircraft();
+  _a.copy(flight.p).normalize();
+  _b.copy(flight.f);
+  flight.park(_c.copy(_a).multiplyScalar(R + wheels + flight.spec.gearDrop * planeScale), _b, _a);
+  if (wasNear) parkPlaneAhead(flight.spec.parkAhead);
+}
+
 const canJump = (agl) => !flight.grounded && agl > JUMP_MIN_AGL;
+
+// --- crashes ------------------------------------------------------------------------
+const groundAt = (p) => {
+  const s = sampleAt(_tmp.copy(p).normalize());
+  return s ? s.h : null;
+};
+const _tmp = new THREE.Vector3();
+const _lookM = new THREE.Matrix4();
+
+function hideCrash() {
+  crash = null;
+  $('crash').classList.remove('on', 'fade');
+}
+
+// Freezes the action at the impact point, blows the wreck apart and starts an orbiting wreck cam.
+function startCrash(kind, { pos, vel, speed, text, heading }) {
+  const up = pos.clone().normalize();
+  const gs = sampleAt(up);
+  const ground = gs ? gs.h : 0;
+  const water = !!gs && !!gs.water && pos.length() - R - gs.h < 12;
+  const sc = kind === 'plane' ? planeScale * flight.spec.fx : 1;
+  effects.explode(pos, up, vel, { water, scale: sc, speed, style: kind === 'diver' ? 'diver' : 'plane' });
+  const back = vel.clone().addScaledVector(up, -vel.dot(up));
+  if (back.lengthSq() < 0.25) back.crossVectors(up, new THREE.Vector3(0, 1, 0));
+  back.normalize().negate();
+  mode = 'crash';
+  settle = null;
+  document.exitPointerLock?.();
+  diver.hide();
+  crash = {
+    kind,
+    t: 0,
+    site: pos.clone(),
+    up,
+    az: back,
+    side: new THREE.Vector3().crossVectors(up, back).normalize(),
+    dist: kind === 'plane' ? flight.spec.crashDist * planeScale : 9,
+    sc,
+    ground,
+    lat: dirToLat(up.x, up.y, up.z),
+    lon: dirToLon(up.x, up.z),
+    heading: heading ?? 0,
+    shown: false,
+  };
+  $('crash-title').textContent = kind === 'plane' ? (water ? 'Splashdown' : 'Crashed') : water ? 'Splashdown' : 'Hard landing';
+  $('crash-msg').textContent = text;
+  const b = $('crash-again');
+  b.textContent = kind === 'plane' ? 'Fly again' : 'Back in a plane';
+  camInit = false;
+}
+
+function updateCrash(dt) {
+  crash.t += dt;
+  if (!crash.shown && crash.t > 1.5) {
+    crash.shown = true;
+    $('crash').classList.add('on');
+  }
+  if (crash.t > 6.2) $('crash').classList.add('fade');
+  if (crash.t > 7.4) respawnAfterCrash();
+}
+
+function crashContinue() {
+  if (crash && crash.t > 0.8) respawnAfterCrash();
+}
+
+function respawnAfterCrash() {
+  const c = crash;
+  if (!c) return;
+  spawn({ lat: c.lat, lon: c.lon, alt: Math.max(c.ground, 0) + (c.kind === 'plane' ? 350 : 500), heading: c.heading, pitch: 0 });
+}
+
+function crashCamera(outPos, outQuat) {
+  const c = crash;
+  const k = Math.min(1, c.t / 3);
+  const ang = c.t * 0.2;
+  const d = c.dist * (1 + 0.3 * k);
+  _tmp.copy(c.az).multiplyScalar(Math.cos(ang)).addScaledVector(c.side, Math.sin(ang)).multiplyScalar(d);
+  outPos.copy(c.site).add(_tmp).addScaledVector(c.up, d * (0.22 + 0.18 * k) + 1.5 * c.sc);
+  const gh = groundAt(outPos);
+  const minR = R + (gh ?? c.ground) + 2;
+  if (outPos.length() < minR) outPos.multiplyScalar(minR / outPos.length());
+  _a.copy(c.site).addScaledVector(c.up, 2 * c.sc + 2 * k);
+  _lookM.lookAt(outPos, _a, c.up);
+  outQuat.setFromRotationMatrix(_lookM);
+}
 
 // Leaves the plane in mid-air; the plane keeps flying on its own.
 function startChute() {
-  const exit = _b.copy(flight.r).multiplyScalar(3.5 * planeScale).add(flight.p);
+  const exit = _b.copy(flight.r).multiplyScalar(flight.spec.exitSide * planeScale).add(flight.p);
   flight.velocity(_c);
   diver.start(exit, flight.f, _c);
   mode = 'chute';
@@ -182,13 +328,33 @@ function startChute() {
 }
 
 function touchdown(res) {
+  const speed = res.speed;
+  if (speed > 14) {
+    diver.velocity(_c);
+    startCrash('diver', {
+      pos: diver.p.clone(),
+      vel: _c.clone(),
+      speed,
+      heading: diver.headingDeg,
+      text: diver.open < 0.5 ? 'The parachute never opened in time.' : `You hit the ground at ${(speed * 3.6).toFixed(0)} km/h.`,
+    });
+    return;
+  }
   if (res.water) {
     // no swimming: put the player back in a plane over the same spot
     showNotice('Splashdown! Back in the plane.', 4);
     spawn({ lat: diver.lat, lon: diver.lon, alt: 600, heading: diver.headingDeg, pitch: -3 });
     return;
   }
-  const speed = res.speed;
+  diver.land(speed);
+  _b.copy(diver.up);
+  diver.velocity(_c);
+  _a.copy(diver.p).addScaledVector(_b, -HIP);
+  effects.puff(_a, _b, _c, 1 + speed * 0.6, 0.6);
+}
+
+// The diver has run out the landing and the canopy is down: hand over to walking.
+function finishLanding() {
   walker.place(_a.copy(diver.p).normalize(), diver.f, diver.alt - HIP);
   diver.hide();
   mode = 'walk';
@@ -196,24 +362,24 @@ function touchdown(res) {
   planeGone = true;
   planeScale = 1;
   camInit = false;
-  if (speed > 9) showNotice('HARD LANDING', 3);
 }
 
 // Puts the plane on the ground a few metres ahead of the walker.
 function parkPlaneAhead(dist) {
+  applyAircraft();
   const dir = _b.copy(walker.n).multiplyScalar(R).addScaledVector(walker.f, dist).normalize();
   const s = sampleAt(dir);
   const h = s ? s.h : walker.foot;
-  const pos = _c.copy(dir).multiplyScalar(R + h + GEAR_DROP);
+  const pos = _c.copy(dir).multiplyScalar(R + h + flight.spec.gearDrop);
   flight.park(pos, walker.f, dir);
   planeGone = false;
 }
 
 function exitPlane() {
-  const side = _b.copy(flight.r).multiplyScalar(9);
+  const side = _b.copy(flight.r).multiplyScalar(flight.spec.walkOff);
   const dir = _c.copy(flight.p).normalize().multiplyScalar(R).add(side).normalize();
   const s = sampleAt(dir);
-  const h = s && !s.water ? s.h : flight.alt - GEAR_DROP;
+  const h = s && !s.water ? s.h : flight.alt - flight.spec.gearDrop;
   walker.place(dir, flight.f, h);
   flight.stop();
   mode = 'walk';
@@ -222,12 +388,12 @@ function exitPlane() {
 }
 
 function nearPlane() {
-  return !planeGone && _a.copy(walker.n).multiplyScalar(R + walker.foot).distanceTo(flight.p) < 16;
+  return !planeGone && _a.copy(walker.n).multiplyScalar(R + walker.foot).distanceTo(flight.p) < flight.spec.boardDist;
 }
 
 function boardPlane() {
   mode = 'fly';
-  flight.throttle = 0;
+  flight.throttle = flight.eng = 0;
   flight.stop();
   lookYaw = lookPitch = 0;
   camInit = false;
@@ -236,7 +402,7 @@ function boardPlane() {
 
 // The round on-screen button (and the Enter/J/Space/P keys) do whatever makes sense right now.
 function actionLabel(agl) {
-  if (paused) return '';
+  if (paused || mode === 'crash') return '';
   if (mode === 'fly') return flight.landed ? 'Exit plane' : canJump(agl) ? 'Parachute' : '';
   if (mode === 'walk') return settle ? '' : nearPlane() ? 'Board plane' : 'Call plane';
   return diver.deployed ? '' : 'Open chute';
@@ -244,13 +410,14 @@ function actionLabel(agl) {
 
 function doAction() {
   if (paused) return;
+  if (mode === 'crash') return crashContinue();
   if (mode === 'fly') {
     if (flight.landed) exitPlane();
     else if (canJump(flight.alt - (world.ground.height ?? 0))) startChute();
   } else if (mode === 'walk') {
     if (settle) return;
     if (nearPlane()) boardPlane();
-    else parkPlaneAhead(14);
+    else parkPlaneAhead(flight.spec.parkAhead);
   } else diver.deploy();
 }
 
@@ -282,7 +449,8 @@ window.addEventListener('keydown', (e) => {
   if (e.repeat) return;
   switch (e.code) {
     case 'Enter':
-      if (mode === 'fly') {
+      if (mode === 'crash') crashContinue();
+      else if (mode === 'fly') {
         if (flight.landed) exitPlane();
       } else if (mode === 'walk' && !settle && nearPlane()) {
         boardPlane();
@@ -293,9 +461,10 @@ window.addEventListener('keydown', (e) => {
       break;
     case 'Space':
       if (mode === 'chute') diver.deploy();
+      else if (mode === 'crash') crashContinue();
       break;
     case 'KeyP':
-      if (mode === 'walk' && !settle) parkPlaneAhead(14);
+      if (mode === 'walk' && !settle) parkPlaneAhead(flight.spec.parkAhead);
       break;
     case 'KeyC':
       chase = !chase;
@@ -358,15 +527,15 @@ const locked = () => document.pointerLockElement === canvas;
 window.addEventListener('mousemove', (e) => {
   if (paused || settle || !locked()) return;
   if (mode === 'walk') walker.turn(e.movementX * 0.0022, -e.movementY * 0.0022);
-  else if (mode === 'chute') diver.turn(e.movementX * 0.0022, -e.movementY * 0.0022);
+  else if (mode === 'chute') diver.lookBy(e.movementX * 0.0022, -e.movementY * 0.0022);
 });
 document.addEventListener('pointerlockchange', () => {
   if (locked()) return;
   lastUnlock = performance.now();
-  if (mode !== 'fly' && !paused && !touch.enabled) toggleMenu(true);
+  if (mode !== 'fly' && mode !== 'crash' && !paused && !touch.enabled) toggleMenu(true);
 });
 canvas.addEventListener('click', () => {
-  if (mode !== 'fly' && !paused && !locked()) lockPointer();
+  if (mode !== 'fly' && mode !== 'crash' && !paused && !locked()) lockPointer();
 });
 
 function readFlightInput(dt) {
@@ -393,12 +562,14 @@ function readWalkInput(dt) {
   };
 }
 
-function readChuteInput(dt) {
+function readChuteInput() {
   const k = (c) => (keys.has(c) ? 1 : 0);
-  const turn = clamp1(k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') + touch.stick.x);
   const [dx, dy] = takeLook();
-  diver.turn(turn * 1.3 * dt + dx * 0.0055, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt - dy * 0.0055);
-  return { fwd: clamp1(k('KeyW') - k('KeyS') + touch.stick.y), turn };
+  if (dx || dy) diver.lookBy(dx * 0.0055, -dy * 0.0055);
+  chuteInput.steer = clamp1(k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') + touch.stick.x);
+  chuteInput.speed = clamp1(k('KeyW') + k('ArrowUp') - k('KeyS') - k('ArrowDown') + touch.stick.y);
+  chuteInput.flare = !!(diver.deployed && (k('Space') || touch.brake));
+  return chuteInput;
 }
 
 initTouch({
@@ -428,10 +599,21 @@ function toggleMenu(show) {
   paused = want;
   keys.clear();
   if (want) document.exitPointerLock?.();
-  else if (mode !== 'fly') lockPointer();
+  else if (mode !== 'fly' && mode !== 'crash') lockPointer();
 }
 
 function buildMenu() {
+  for (const id of AIRCRAFT_IDS) {
+    const b = document.createElement('button');
+    b.dataset.id = id;
+    b.innerHTML = `${AIRCRAFT[id].name}<small>${AIRCRAFT[id].desc}</small>`;
+    b.onclick = () => {
+      chooseAircraft(id);
+      toggleMenu(false);
+    };
+    $('aircraft').appendChild(b);
+  }
+  syncAircraftButtons();
   const add = (parent, list, extra) => {
     for (const p of list) {
       const b = document.createElement('button');
@@ -527,6 +709,7 @@ $('search-input').addEventListener('keydown', (e) => {
 });
 $('search-input').addEventListener('blur', () => setTimeout(hideSearch, 250));
 buildMenu();
+$('crash-again').onclick = crashContinue;
 
 const hud = {
   speed: $('h-speed'),
@@ -608,11 +791,24 @@ function updateHud(dt, agl) {
     hud.pos.textContent = `${diver.lat.toFixed(5)}°, ${diver.lon.toFixed(5)}°`;
     hud.hdg.textContent = `${diver.headingDeg.toFixed(0)}°`;
     hud.thr.style.width = '0%';
-    hud.prompt.textContent = !diver.deployed
-      ? tip('[Space] Open parachute · W dive · S arch', 'Open the parachute · stick up to dive')
-      : diver.flying
-        ? tip('W/S speed · A/D steer · mouse look', 'Stick to steer · pull down to flare when landing')
-        : 'Canopy opening…';
+    hud.prompt.textContent = diver.landed
+      ? ''
+      : !diver.deployed
+        ? tip('[Space] Open parachute · A/D turn · W dive · S slow', 'Open the parachute · stick up to dive')
+        : !diver.flying
+          ? 'Canopy opening…'
+          : diver.agl < 40
+            ? tip('Hold [Space] to flare just above the ground · steer into the wind', 'Hold FLARE just above the ground')
+            : tip('A/D steer · W speed bar · S brakes · Space flare · mouse looks around', 'Stick: steer / speed · FLARE to brake · drag to look');
+  } else if (mode === 'crash') {
+    hud.speed.textContent = '–';
+    hud.alt.textContent = '–';
+    hud.agl.textContent = '–';
+    hud.vs.textContent = '–';
+    hud.pos.textContent = `${crash.lat.toFixed(4)}°, ${crash.lon.toFixed(4)}°`;
+    hud.hdg.textContent = '–';
+    hud.thr.style.width = '0%';
+    hud.prompt.textContent = '';
   } else {
     hud.speed.textContent = 'on foot';
     hud.alt.textContent = fmtDist(walker.foot);
@@ -664,15 +860,32 @@ function frame() {
   // --- simulate ---
   const ground = world.ground.height;
   let agl;
-  let chuteTurn = 0;
   if (mode === 'fly') {
     if (!paused) {
-      flight.update(dt, readFlightInput(dt), planeScale, ground, GEAR_DROP);
+      flight.update(dt, readFlightInput(dt), planeScale, ground, flight.spec.gearDrop);
+      if (flight.touchEvent) {
+        const te = flight.touchEvent;
+        flight.touchEvent = null;
+        flight.velocity(_c);
+        _b.copy(flight.p).normalize();
+        _a.copy(flight.p).addScaledVector(_b, -flight.spec.gearDrop * planeScale);
+        if (te.speed > 12) effects.puff(_a, _b, _c, (1.5 + te.vsink * 0.7 + te.speed / 30) * flight.spec.fx, planeScale * flight.spec.fx);
+      }
       if (flight.crashSevere) {
-        // destroyed: a fresh plane appears high above the same spot
-        const a = Math.max(flight.alt, (ground ?? 0)) + 300;
-        spawn({ lat: flight.lat, lon: flight.lon, alt: Math.max(a, 400), heading: flight.headingDeg, pitch: 0 });
-        showNotice('CRASHED – new plane', 3.5);
+        const im = flight.impact;
+        const kmh = (im.speed * 3.6).toFixed(0);
+        startCrash('plane', {
+          pos: im.pos,
+          vel: im.vel,
+          speed: im.speed,
+          heading: flight.headingDeg,
+          text:
+            im.kind === 'wall'
+              ? `You flew into an obstacle at ${kmh} km/h.`
+              : im.vsink > 12
+                ? `You hit the ground at ${(im.vsink * 3.6).toFixed(0)} km/h vertical speed.`
+                : `Bad landing angle at ${kmh} km/h. Keep the wings level and the nose up.`,
+        });
       }
     }
     const [ldx, ldy] = takeLook();
@@ -687,18 +900,21 @@ function frame() {
     agl = flight.alt - (ground ?? 0);
     const targetScale = Math.max(1, agl / 1200);
     planeScale *= Math.pow(targetScale / planeScale, Math.min(1, dt * 3));
+  } else if (mode === 'crash') {
+    if (!paused) updateCrash(dt);
+    agl = 60;
   } else if (mode === 'chute') {
     const gs = sampleAt(_c.copy(diver.p).normalize());
     chuteGround.h = gs ? (gs.water ? Math.max(gs.h, 0) : gs.h) : 0;
     chuteGround.water = gs ? gs.water : 0;
     if (!paused) {
-      const input = readChuteInput(dt);
-      chuteTurn = input.turn;
+      const input = readChuteInput();
       const res = diver.update(dt, input, chuteGround);
       // the abandoned plane flies on by itself
       const pg = sampleAt(_c.copy(flight.p).normalize());
-      flight.update(dt, NO_INPUT, planeScale, pg ? pg.h : 0, GEAR_DROP);
+      flight.update(dt, NO_INPUT, planeScale, pg ? pg.h : 0, flight.spec.gearDrop);
       if (res) touchdown(res);
+      else if (diver.finished) finishLanding();
     }
     agl = Math.max(1.7, diver.agl);
     planeScale += (1 - planeScale) * Math.min(1, dt * 3);
@@ -713,7 +929,7 @@ function frame() {
         if (s) {
           const keepPlane = settle.keepPlane;
           settle = null;
-          if (!keepPlane) parkPlaneAhead(14);
+          if (!keepPlane) parkPlaneAhead(flight.spec.parkAhead);
         } else if (settle.t > 40) settle = null;
       }
     } else if (!paused) {
@@ -737,11 +953,11 @@ function frame() {
     lookQuat.setFromEuler(lookEuler);
     _q.copy(camQuat).multiply(lookQuat);
     if (chase) {
-      _a.set(0, 6 * s, 22 * s).applyQuaternion(_q);
+      _a.set(0, flight.spec.chase[0] * s, flight.spec.chase[1] * s).applyQuaternion(_q);
       camPos.copy(flight.p).add(_a);
       _q.multiply(pitchDown);
     } else {
-      _a.set(0, 1.4 * s, -1.5 * s).applyQuaternion(camQuat);
+      _a.set(0, flight.spec.eye[0] * s, flight.spec.eye[1] * s).applyQuaternion(camQuat);
       camPos.copy(flight.p).add(_a);
     }
     if (flight.stalled && !flight.grounded) {
@@ -750,12 +966,16 @@ function frame() {
     }
     camera.near = Math.max(0.3, 0.4 * s);
     const vNorm = flight.vn.length();
-    const fovT = 65 + 14 * smooth(vNorm, 70, 260);
+    const fovT = 65 + flight.spec.fov * smooth(vNorm, flight.spec.trimSpeed * 0.8, flight.spec.trimSpeed * 2.9);
     camera.fov += (fovT - camera.fov) * Math.min(1, dt * 3);
+  } else if (mode === 'crash') {
+    crashCamera(camPos, _q);
+    camera.near = Math.max(0.3, 0.3 * crash.sc);
+    camera.fov += (62 - camera.fov) * Math.min(1, dt * 3);
   } else if (mode === 'chute') {
     diver.cameraRig(camPos, _q, chuteGround.h);
     camera.near = 0.2;
-    camera.fov = 70;
+    camera.fov += (diver.fov - camera.fov) * Math.min(1, dt * 4);
   } else {
     walker.eyePosition(camPos);
     walker.basisQuaternion(_q);
@@ -768,12 +988,17 @@ function frame() {
   camera.updateProjectionMatrix();
   camera.updateMatrixWorld();
 
-  plane.visible = !planeGone && (mode !== 'fly' || chase);
+  plane.visible = !planeGone && mode !== 'crash' && (mode !== 'fly' || chase);
   plane.position.copy(flight.p).sub(camPos);
   plane.quaternion.copy(planeQuat);
   plane.scale.setScalar(s);
-  plane.userData.update(dt, mode === 'fly' ? flight.throttle : 0);
-  if (mode === 'chute') diver.syncMeshes(camPos, chuteTurn, dt);
+  plane.userData.update(dt, mode === 'fly' ? flight.eng : 0, {
+    ab: mode === 'fly' ? flight.ab : 0,
+    grounded: flight.grounded,
+    agl: flight.alt - (world.ground.height ?? 0),
+    speed: flight.speed,
+  });
+  if (mode === 'chute') diver.syncMeshes(camPos, dt);
   else diver.hide();
 
   // --- lighting uniforms ---
@@ -782,6 +1007,7 @@ function frame() {
   const sunUp = camUp.dot(env.sun);
   const nightF = (1 - smooth(sunUp, -0.22, 0.04)) * (1 - smooth(camAlt, 20000, 120000));
   shared.uExposure.value = 0.9 + 0.9 * nightF;
+  effects.update(dt, camPos, groundAt, smooth(sunUp, -0.12, 0.2));
   env.camPos.copy(camPos);
   shared.uUpC.value.copy(camUp);
   shared.uSunH.value.copy(env.sun).addScaledVector(camUp, -sunUp);
@@ -810,7 +1036,7 @@ function frame() {
   const shScale = THREE.MathUtils.clamp(Math.max(1, agl / 250), 1, 10);
   const shStrength = shadows.enabled ? (1 - smooth(agl, 3000, 8000)) * smooth(sunUp, -0.03, 0.05) : 0;
   world.keepRadius = shStrength > 0 ? Math.min(900, shadows.extent(shScale)) : 0;
-  const pos = mode === 'fly' ? flight.lat : mode === 'chute' ? diver.lat : walker.lat;
+  const pos = mode === 'fly' ? flight.lat : mode === 'chute' ? diver.lat : mode === 'crash' ? crash.lat : walker.lat;
   const lon = currentLon();
   const m = llToMerc(pos, lon);
   world.update(camera, camPos, renderer.domElement.height / renderer.getPixelRatio(), m.u, m.v);
@@ -839,6 +1065,7 @@ window.__earth = {
   setHour: (h) => { sunLon = sunLonFor(currentLon(), h); },
   setDayRate: (v) => { dayRate = v; },
   setPaused: (v) => toggleMenu(v),
-  startChute, touch, doAction,
-  exitPlane, boardPlane, parkPlaneAhead,
+  startChute, touch, doAction, effects, startCrash,
+  get crash() { return crash; },
+  exitPlane, boardPlane, parkPlaneAhead, chooseAircraft,
 };
