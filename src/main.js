@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { R, llToDir, llToMerc, dirToLat, dirToLon } from './geo.js';
-import { Flight } from './flight.js';
+import { Flight, TRIM_THROTTLE } from './flight.js';
 import { World } from './world.js';
 import { createPlane, GEAR_DROP } from './plane.js';
 import { Walker } from './walker.js';
@@ -8,6 +8,7 @@ import { Skydiver, HIP } from './skydiver.js';
 import { Shadows } from './shadows.js';
 import { Bloom } from './bloom.js';
 import { env, shared, createVoxelMaterial, createSky, createAtmosphere, createSkyLUT, CLOUD_PERIOD } from './materials.js';
+import { touch, initTouch, setMode as setTouchMode, setAction as setTouchAction, setThrottleDisplay, setSprint, takeLook, TOUCH_DEVICE } from './touch.js';
 
 const PRESETS = [
   { name: 'Orbit view', lat: 20, lon: -40, alt: 11_000_000, heading: 0, pitch: -80 },
@@ -33,7 +34,7 @@ const WALK_PRESETS = [
 ];
 
 const QUALITY = { Low: 14, Medium: 8, High: 5, Ultra: 3.5 };
-const DEFAULT_QUALITY = 'High';
+const DEFAULT_QUALITY = TOUCH_DEVICE ? 'Medium' : 'High';
 const JUMP_MIN_AGL = 250; // metres above ground needed to jump
 
 // --- renderer / scene -----------------------------------------------------
@@ -45,7 +46,7 @@ const renderer = new THREE.WebGLRenderer({
   powerPreference: 'high-performance',
 });
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // shaders output sRGB-encoded values themselves
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, TOUCH_DEVICE ? 1.5 : 2));
 renderer.autoClear = true;
 
 const scene = new THREE.Scene();
@@ -100,7 +101,15 @@ let settle = null; // { t } while waiting for ground tiles to stream in under a 
 let lastUnlock = 0;
 const camQuat = new THREE.Quaternion();
 const chuteGround = { h: 0, water: 0 };
-const NO_INPUT = { pitch: 0, roll: 0, yaw: 0 };
+const NO_INPUT = { pitch: 0, roll: 0, yaw: 0, brake: false };
+const flightInput = { pitch: 0, roll: 0, yaw: 0, brake: false };
+let lookYaw = 0; // free-look offset in fly mode; springs back when released
+let lookPitch = 0;
+const lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+const lookQuat = new THREE.Quaternion();
+const shakeEuler = new THREE.Euler();
+const shakeQuat = new THREE.Quaternion();
+const clamp1 = (x) => Math.min(1, Math.max(-1, x));
 const planeQuat = new THREE.Quaternion();
 const camPos = new THREE.Vector3();
 const _a = new THREE.Vector3();
@@ -127,6 +136,10 @@ function showNotice(text, secs = 3) {
   notice = { text, until: performance.now() + secs * 1000 };
 }
 
+function lockPointer() {
+  if (!touch.enabled) canvas.requestPointerLock?.()?.catch?.(() => {});
+}
+
 function spawn(p) {
   if (p.ground) return startOnFoot(p);
   mode = 'fly';
@@ -135,8 +148,8 @@ function spawn(p) {
   diver.hide();
   document.exitPointerLock?.();
   flight.spawn(p.lat, p.lon, p.alt, p.heading, p.pitch);
-  flight.throttle = 0.45;
-  flight.speed = 0;
+  flight.throttle = TRIM_THROTTLE;
+  lookYaw = lookPitch = 0;
   planeScale = Math.max(1, p.alt / 1200);
   sunLon = sunLonFor(p.lon, tod);
   camInit = false;
@@ -144,7 +157,7 @@ function spawn(p) {
 
 function startOnFoot(p) {
   flight.spawn(p.lat, p.lon, 0, p.heading, 0);
-  flight.speed = 0;
+  flight.stop();
   flight.throttle = 0;
   walker.place(_a.copy(flight.p).normalize(), flight.f, 0);
   mode = 'walk';
@@ -156,14 +169,16 @@ function startOnFoot(p) {
   camInit = false;
 }
 
+const canJump = (agl) => !flight.grounded && agl > JUMP_MIN_AGL;
+
 // Leaves the plane in mid-air; the plane keeps flying on its own.
 function startChute() {
   const exit = _b.copy(flight.r).multiplyScalar(3.5 * planeScale).add(flight.p);
-  _c.copy(flight.f).multiplyScalar(flight.speed);
+  flight.velocity(_c);
   diver.start(exit, flight.f, _c);
   mode = 'chute';
   camInit = false;
-  canvas.requestPointerLock?.()?.catch?.(() => {});
+  lockPointer();
 }
 
 function touchdown(res) {
@@ -200,10 +215,10 @@ function exitPlane() {
   const s = sampleAt(dir);
   const h = s && !s.water ? s.h : flight.alt - GEAR_DROP;
   walker.place(dir, flight.f, h);
-  flight.speed = 0;
+  flight.stop();
   mode = 'walk';
   camInit = false;
-  canvas.requestPointerLock?.()?.catch?.(() => {});
+  lockPointer();
 }
 
 function nearPlane() {
@@ -213,9 +228,30 @@ function nearPlane() {
 function boardPlane() {
   mode = 'fly';
   flight.throttle = 0;
-  flight.speed = 0;
+  flight.stop();
+  lookYaw = lookPitch = 0;
   camInit = false;
   document.exitPointerLock?.();
+}
+
+// The round on-screen button (and the Enter/J/Space/P keys) do whatever makes sense right now.
+function actionLabel(agl) {
+  if (paused) return '';
+  if (mode === 'fly') return flight.landed ? 'Exit plane' : canJump(agl) ? 'Parachute' : '';
+  if (mode === 'walk') return settle ? '' : nearPlane() ? 'Board plane' : 'Call plane';
+  return diver.deployed ? '' : 'Open chute';
+}
+
+function doAction() {
+  if (paused) return;
+  if (mode === 'fly') {
+    if (flight.landed) exitPlane();
+    else if (canJump(flight.alt - (world.ground.height ?? 0))) startChute();
+  } else if (mode === 'walk') {
+    if (settle) return;
+    if (nearPlane()) boardPlane();
+    else parkPlaneAhead(14);
+  } else diver.deploy();
 }
 
 function sunDirection() {
@@ -253,7 +289,7 @@ window.addEventListener('keydown', (e) => {
       }
       break;
     case 'KeyJ':
-      if (mode === 'fly' && !flight.grounded && flight.alt - (world.ground.height ?? 0) > JUMP_MIN_AGL) startChute();
+      if (mode === 'fly' && canJump(flight.alt - (world.ground.height ?? 0))) startChute();
       break;
     case 'Space':
       if (mode === 'chute') diver.deploy();
@@ -265,10 +301,10 @@ window.addEventListener('keydown', (e) => {
       chase = !chase;
       break;
     case 'KeyI':
-      flight.invertPitch = !flight.invertPitch;
+      setInvert(!flight.invertPitch);
       break;
     case 'KeyL':
-      flight.autoLevel = !flight.autoLevel;
+      setAssist(!flight.assist);
       break;
     case 'KeyT':
       if (dayRate) {
@@ -306,6 +342,18 @@ window.addEventListener(
   { passive: true },
 );
 
+function setAssist(on) {
+  flight.assist = on;
+  $('assist').checked = on;
+  showNotice(`Flight assist ${on ? 'on' : 'off'}`, 1.5);
+}
+
+function setInvert(on) {
+  flight.invertPitch = on;
+  $('invert').checked = on;
+  showNotice(`Pitch ${on ? 'inverted' : 'normal'}`, 1.5);
+}
+
 const locked = () => document.pointerLockElement === canvas;
 window.addEventListener('mousemove', (e) => {
   if (paused || settle || !locked()) return;
@@ -315,40 +363,60 @@ window.addEventListener('mousemove', (e) => {
 document.addEventListener('pointerlockchange', () => {
   if (locked()) return;
   lastUnlock = performance.now();
-  if (mode !== 'fly' && !paused) toggleMenu(true);
+  if (mode !== 'fly' && !paused && !touch.enabled) toggleMenu(true);
 });
 canvas.addEventListener('click', () => {
-  if (mode !== 'fly' && !paused && !locked()) canvas.requestPointerLock?.()?.catch?.(() => {});
+  if (mode !== 'fly' && !paused && !locked()) lockPointer();
 });
 
 function readFlightInput(dt) {
   const k = (c) => (keys.has(c) ? 1 : 0);
   if (k('ShiftLeft') || k('ShiftRight') || k('KeyR') || k('Equal')) flight.throttle = Math.min(1, flight.throttle + dt * 0.35);
   if (k('ControlLeft') || k('ControlRight') || k('KeyF') || k('Minus')) flight.throttle = Math.max(0, flight.throttle - dt * 0.35);
-  return {
-    pitch: k('KeyS') + k('ArrowDown') - k('KeyW') - k('ArrowUp'),
-    roll: k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft'),
-    yaw: k('KeyE') - k('KeyQ'),
-  };
+  const i = flightInput;
+  i.pitch = clamp1(k('KeyS') + k('ArrowDown') - k('KeyW') - k('ArrowUp') - touch.stick.y);
+  i.roll = clamp1(k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') + touch.stick.x);
+  i.yaw = clamp1(k('KeyE') - k('KeyQ') + touch.rudder);
+  i.brake = !!(k('Space') || k('KeyB') || touch.brake);
+  return i;
 }
 
 function readWalkInput(dt) {
   const k = (c) => (keys.has(c) ? 1 : 0);
-  walker.turn((k('ArrowRight') - k('ArrowLeft')) * 1.8 * dt, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt);
+  const [dx, dy] = takeLook();
+  walker.turn((k('ArrowRight') - k('ArrowLeft')) * 1.8 * dt + dx * 0.0055, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt - dy * 0.0055);
   return {
-    fwd: k('KeyW') - k('KeyS'),
-    strafe: k('KeyD') - k('KeyA'),
-    sprint: k('ShiftLeft') || k('ShiftRight'),
-    jump: k('Space'),
+    fwd: clamp1(k('KeyW') - k('KeyS') + touch.stick.y),
+    strafe: clamp1(k('KeyD') - k('KeyA') + touch.stick.x),
+    sprint: k('ShiftLeft') || k('ShiftRight') || touch.sprint,
+    jump: k('Space') || touch.jump,
   };
 }
 
 function readChuteInput(dt) {
   const k = (c) => (keys.has(c) ? 1 : 0);
-  const turn = k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft');
-  diver.turn(turn * 1.3 * dt, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt);
-  return { fwd: k('KeyW') - k('KeyS'), turn };
+  const turn = clamp1(k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft') + touch.stick.x);
+  const [dx, dy] = takeLook();
+  diver.turn(turn * 1.3 * dt + dx * 0.0055, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt - dy * 0.0055);
+  return { fwd: clamp1(k('KeyW') - k('KeyS') + touch.stick.y), turn };
 }
+
+initTouch({
+  onThrottle: (v) => {
+    flight.throttle = v;
+  },
+  onAction: doAction,
+  onMenu: () => toggleMenu(),
+  onCamera: () => {
+    chase = !chase;
+  },
+  onSearch: () => showSearch(),
+  onFullscreen: () => {
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else document.documentElement.requestFullscreen?.().catch?.(() => {});
+  },
+  canLook: (e) => e.pointerType !== 'mouse' || (mode === 'fly' && !paused),
+});
 
 // --- UI -------------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -360,7 +428,7 @@ function toggleMenu(show) {
   paused = want;
   keys.clear();
   if (want) document.exitPointerLock?.();
-  else if (mode !== 'fly') canvas.requestPointerLock?.()?.catch?.(() => {});
+  else if (mode !== 'fly') lockPointer();
 }
 
 function buildMenu() {
@@ -384,6 +452,20 @@ function buildMenu() {
   };
   $('shadows').onchange = (e) => {
     shadows.enabled = e.target.checked;
+  };
+  if (TOUCH_DEVICE) {
+    $('shadows').checked = false;
+    shadows.enabled = false;
+  }
+  $('assist').onchange = (e) => {
+    flight.assist = e.target.checked;
+  };
+  $('invert').onchange = (e) => {
+    flight.invertPitch = e.target.checked;
+  };
+  $('show-help').onclick = () => {
+    $('help').classList.toggle('hidden');
+    toggleMenu(false);
   };
   const dc = $('daycycle');
   for (const name of Object.keys(DAY_CYCLES)) dc.add(new Option(name, name, false, name === DEFAULT_CYCLE));
@@ -443,12 +525,15 @@ $('search-input').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') hideSearch();
   e.stopPropagation();
 });
+$('search-input').addEventListener('blur', () => setTimeout(hideSearch, 250));
 buildMenu();
 
 const hud = {
   speed: $('h-speed'),
   alt: $('h-alt'),
   agl: $('h-agl'),
+  vs: $('h-vs'),
+  assist: $('h-assist'),
   pos: $('h-pos'),
   hdg: $('h-hdg'),
   time: $('h-time'),
@@ -476,6 +561,12 @@ function syncCycleSelect() {
   $('daycycle').value = name;
 }
 
+function fmtSpeed(s) {
+  return s >= 1000 ? `${(s / 1000).toFixed(1)} km/s` : `${(s * 3.6).toFixed(0)} km/h`;
+}
+
+const tip = (kbd, tch) => (touch.enabled ? tch : kbd);
+
 let hudTimer = 0;
 let fps = 60;
 function updateHud(dt, agl) {
@@ -484,46 +575,57 @@ function updateHud(dt, agl) {
   hudTimer = 0;
   const st = world.stats;
   let warn = '';
+  setTouchMode(mode);
+  setTouchAction(touch.enabled ? actionLabel(agl) : '');
   if (mode === 'fly') {
-    const s = flight.speed;
-    hud.speed.textContent = s >= 1000 ? `${(s / 1000).toFixed(1)} km/s` : `${(s * 3.6).toFixed(0)} km/h`;
+    hud.speed.textContent = fmtSpeed(flight.speed);
     hud.alt.textContent = fmtDist(flight.alt);
     hud.agl.textContent = fmtDist(agl);
+    const vs = flight.vsi;
+    hud.vs.textContent = Math.abs(vs) >= 1000 ? `${(vs / 1000).toFixed(1)} km/s` : `${vs >= 0 ? '+' : ''}${vs.toFixed(0)} m/s`;
+    hud.assist.textContent = flight.assist ? 'on' : 'off';
     hud.pos.textContent = `${flight.lat.toFixed(4)}°, ${flight.lon.toFixed(4)}°`;
-    hud.hdg.textContent = `${flight.headingDeg.toFixed(0)}°  pitch ${flight.pitchDeg.toFixed(0)}°`;
+    hud.hdg.textContent = `${flight.headingDeg.toFixed(0)}°  pitch ${flight.pitchDeg.toFixed(0)}°  bank ${flight.bankDeg.toFixed(0)}°`;
     hud.thr.style.width = `${(flight.throttle * 100).toFixed(0)}%`;
+    setThrottleDisplay(flight.throttle);
     if (flight.crashed) warn = 'HARD LANDING';
+    if (flight.stalled && agl > 3) warn = 'STALL';
+    else if (!flight.grounded && vs < -12 && agl / -vs < 4 && agl < 800) warn = 'PULL UP';
     hud.prompt.textContent = flight.landed
-      ? '[Enter] Exit plane'
+      ? tip('[Enter] Exit plane', 'Tap Exit plane')
       : flight.grounded
-        ? 'Throttle to zero to park'
+        ? flight.throttle > 0.1
+          ? tip('Space brakes · ease back on the stick to take off', 'Pull back on the stick to take off')
+          : tip('Throttle up to take off · Space brakes', 'Raise the throttle to take off')
         : agl > JUMP_MIN_AGL
-          ? '[J] Jump with parachute'
+          ? tip('[J] Jump with parachute', '')
           : '';
   } else if (mode === 'chute') {
     hud.speed.textContent = `${(-diver.vy * 3.6).toFixed(0)} km/h down · ${(diver.hv.length() * 3.6).toFixed(0)} across`;
     hud.alt.textContent = fmtDist(diver.alt);
     hud.agl.textContent = fmtDist(Math.max(0, diver.agl));
+    hud.vs.textContent = `${diver.vy.toFixed(0)} m/s`;
     hud.pos.textContent = `${diver.lat.toFixed(5)}°, ${diver.lon.toFixed(5)}°`;
     hud.hdg.textContent = `${diver.headingDeg.toFixed(0)}°`;
     hud.thr.style.width = '0%';
     hud.prompt.textContent = !diver.deployed
-      ? '[Space] Open parachute · W dive · S arch'
+      ? tip('[Space] Open parachute · W dive · S arch', 'Open the parachute · stick up to dive')
       : diver.flying
-        ? 'W/S speed · A/D steer · mouse look'
+        ? tip('W/S speed · A/D steer · mouse look', 'Stick to steer · pull down to flare when landing')
         : 'Canopy opening…';
   } else {
     hud.speed.textContent = 'on foot';
     hud.alt.textContent = fmtDist(walker.foot);
     hud.agl.textContent = '–';
+    hud.vs.textContent = '–';
     hud.pos.textContent = `${walker.lat.toFixed(5)}°, ${walker.lon.toFixed(5)}°`;
     hud.hdg.textContent = `${walker.headingDeg.toFixed(0)}°`;
     hud.thr.style.width = '0%';
     hud.prompt.textContent = settle
       ? 'Loading terrain…'
       : nearPlane()
-        ? '[Enter] Board plane'
-        : '[P] Call plane · click to look around';
+        ? tip('[Enter] Board plane', 'Tap Board plane')
+        : tip('[P] Call plane · click to look around', 'Drag to look · tap Call plane');
   }
   if (notice && performance.now() < notice.until) warn = notice.text;
   hud.warn.textContent = warn;
@@ -564,8 +666,24 @@ function frame() {
   let agl;
   let chuteTurn = 0;
   if (mode === 'fly') {
-    if (!paused) flight.update(dt, readFlightInput(dt), planeScale, ground, GEAR_DROP);
-    else flight.speed = 0;
+    if (!paused) {
+      flight.update(dt, readFlightInput(dt), planeScale, ground, GEAR_DROP);
+      if (flight.crashSevere) {
+        // destroyed: a fresh plane appears high above the same spot
+        const a = Math.max(flight.alt, (ground ?? 0)) + 300;
+        spawn({ lat: flight.lat, lon: flight.lon, alt: Math.max(a, 400), heading: flight.headingDeg, pitch: 0 });
+        showNotice('CRASHED – new plane', 3.5);
+      }
+    }
+    const [ldx, ldy] = takeLook();
+    if (touch.looking && !paused) {
+      lookYaw = Math.max(-3.2, Math.min(3.2, lookYaw - ldx * 0.006));
+      lookPitch = Math.max(-0.9, Math.min(1.2, lookPitch - ldy * 0.006));
+    } else {
+      const k = Math.exp(-dt * 3);
+      lookYaw *= k;
+      lookPitch *= k;
+    }
     agl = flight.alt - (ground ?? 0);
     const targetScale = Math.max(1, agl / 1200);
     planeScale *= Math.pow(targetScale / planeScale, Math.min(1, dt * 3));
@@ -615,17 +733,25 @@ function frame() {
     } else {
       camQuat.slerp(planeQuat, 1 - Math.exp(-dt * 6));
     }
-    _q.copy(camQuat);
+    lookEuler.set(lookPitch, lookYaw, 0);
+    lookQuat.setFromEuler(lookEuler);
+    _q.copy(camQuat).multiply(lookQuat);
     if (chase) {
-      _a.set(0, 6 * s, 22 * s).applyQuaternion(camQuat);
+      _a.set(0, 6 * s, 22 * s).applyQuaternion(_q);
       camPos.copy(flight.p).add(_a);
       _q.multiply(pitchDown);
     } else {
       _a.set(0, 1.4 * s, -1.5 * s).applyQuaternion(camQuat);
       camPos.copy(flight.p).add(_a);
     }
+    if (flight.stalled && !flight.grounded) {
+      shakeEuler.set((Math.random() - 0.5) * 0.012, (Math.random() - 0.5) * 0.012, (Math.random() - 0.5) * 0.02);
+      _q.multiply(shakeQuat.setFromEuler(shakeEuler));
+    }
     camera.near = Math.max(0.3, 0.4 * s);
-    camera.fov = 65;
+    const vNorm = flight.vn.length();
+    const fovT = 65 + 14 * smooth(vNorm, 70, 260);
+    camera.fov += (fovT - camera.fov) * Math.min(1, dt * 3);
   } else if (mode === 'chute') {
     diver.cameraRig(camPos, _q, chuteGround.h);
     camera.near = 0.2;
@@ -713,6 +839,6 @@ window.__earth = {
   setHour: (h) => { sunLon = sunLonFor(currentLon(), h); },
   setDayRate: (v) => { dayRate = v; },
   setPaused: (v) => toggleMenu(v),
-  startChute,
+  startChute, touch, doAction,
   exitPlane, boardPlane, parkPlaneAhead,
 };

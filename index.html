@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#000000" />
     <title>Voxel Earth Flight</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
@@ -14,10 +17,12 @@
         <div><span>Speed</span><b id="h-speed">0</b></div>
         <div><span>Altitude</span><b id="h-alt">0</b></div>
         <div><span>Above ground</span><b id="h-agl">0</b></div>
-        <div><span>Position</span><b id="h-pos">–</b></div>
+        <div><span>Climb</span><b id="h-vs">0</b></div>
+        <div class="opt"><span>Position</span><b id="h-pos">–</b></div>
         <div><span>Heading</span><b id="h-hdg">–</b></div>
-        <div><span>Local time</span><b id="h-time">–</b></div>
-        <div class="thr"><span>Throttle</span><i><em id="h-thr"></em></i></div>
+        <div class="opt"><span>Local time</span><b id="h-time">–</b></div>
+        <div class="opt"><span>Flight assist</span><b id="h-assist">on</b></div>
+        <div class="thr opt"><span>Throttle</span><i><em id="h-thr"></em></i></div>
       </div>
       <div class="panel" id="net">
         <div id="h-tiles">loading…</div>
@@ -27,15 +32,24 @@
       <div id="prompt"></div>
       <div id="crosshair"></div>
       <div class="panel hidden" id="help">
-        <b>Flight</b> W/S pitch · A/D roll · Q/E yaw · Shift/Ctrl throttle (0 to stop) · wheel<br />
-        <b>Landing</b> throttle to zero on a flat spot, wheels roll, then <b>Enter</b> to step out<br />
-        <b>On foot</b> click to look · WASD move · Shift sprint · Space jump · <b>Enter</b> board plane (when close) · P call plane<br />
-        <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: WASD steer · <b>Space</b> open parachute · canopy: WASD steer, S flare to land<br />
-        <b>Camera</b> C chase/cockpit · <b>Time</b> [ ] shift, T pause/resume day cycle (see menu)<br />
-        <b>Other</b> G go to place · I invert pitch · L auto-level · H show/hide these controls · Esc/M menu
+        <span class="kbd-only">
+          <b>Flight</b> W/S pitch · A/D roll · Q/E rudder · Shift/Ctrl (or wheel) throttle · <b>Space</b> brake · drag the mouse to look around<br />
+          <b>Take-off</b> full throttle, hold the nose level until ~150 km/h, then ease back (W/S) · don't pull up too hard or the plane stalls<br />
+          <b>Landing</b> throttle back, level wings, flare gently just above the runway, then <b>Space</b> to brake and <b>Enter</b> to step out<br />
+          <b>On foot</b> click to look · WASD move · Shift sprint · Space jump · <b>Enter</b> board plane (when close) · P call plane<br />
+          <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: WASD steer · <b>Space</b> open parachute · canopy: WASD steer, S flare to land<br />
+          <b>Camera</b> C chase/cockpit · <b>Time</b> [ ] shift, T pause/resume day cycle (see menu)<br />
+          <b>Other</b> G go to place · I invert pitch · L flight assist on/off · H show/hide these controls · Esc/M menu
+        </span>
+        <span class="touch-only">
+          <b>Flight</b> right stick: pitch &amp; roll · left lever: throttle · ◀ ▶ rudder · BRAKE on the ground · drag the sky to look around<br />
+          <b>On foot</b> left stick moves · drag to look · JUMP · SPRINT · the round button boards/calls the plane<br />
+          <b>Skydive</b> use the round button to jump from the plane and to open the parachute<br />
+          <b>Top right</b> ☰ menu · camera · search · fullscreen
+        </span>
       </div>
       <div class="attrib">
-        <b>H</b> controls · Terrain: AWS Terrain Tiles (Mapzen/NASA/USGS) · Buildings &amp; water: © OpenStreetMap contributors via OpenFreeMap ·
+        <b class="kbd-only">H controls</b><b class="touch-only">Menu › Controls</b> · Terrain: AWS Terrain Tiles (Mapzen/NASA/USGS) · Buildings &amp; water: © OpenStreetMap contributors via OpenFreeMap ·
         Imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community
       </div>
     </div>
@@ -68,12 +82,35 @@
         <div class="row">
           <label>Detail <select id="quality"></select></label>
           <label><input type="checkbox" id="shadows" checked /> Shadows</label>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" id="assist" checked /> Flight assist</label>
+          <label><input type="checkbox" id="invert" /> Invert pitch</label>
+          <button id="show-help">Controls</button>
           <button id="resume" class="primary">Resume</button>
         </div>
-        <p class="small">
-          W/S pitch · A/D roll · Q/E yaw · Shift/Ctrl throttle · Enter exit/board plane · J jump with parachute · C camera · G search · Esc menu
+        <p class="small kbd-only">
+          W/S pitch · A/D roll · Q/E rudder · Shift/Ctrl throttle · Space brake · Enter exit/board plane · J jump with parachute · C camera · G search · Esc menu
         </p>
+        <p class="small touch-only">Right stick pitch/roll · left lever throttle · ◀ ▶ rudder · drag to look · round button = context action</p>
       </div>
+    </div>
+
+    <div id="touch">
+      <div id="tc-top">
+        <button id="tb-cam" aria-label="Camera">🎥</button>
+        <button id="tb-search" aria-label="Search">🔍</button>
+        <button id="tb-full" aria-label="Fullscreen">⛶</button>
+        <button id="tb-menu" aria-label="Menu">☰</button>
+      </div>
+      <div id="tc-throttle"><i><em id="tc-thr-fill"></em></i><span>THR</span></div>
+      <button id="tb-brake">BRAKE</button>
+      <button id="tb-rl" aria-label="Rudder left">◀</button>
+      <button id="tb-rr" aria-label="Rudder right">▶</button>
+      <div id="tc-stick"><div class="knob"></div></div>
+      <button id="tb-jump">JUMP</button>
+      <button id="tb-sprint">SPRINT</button>
+      <button id="tb-action"></button>
     </div>
 
     <script type="module" src="/src/main.js"></script>
