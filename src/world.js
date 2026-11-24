@@ -28,6 +28,10 @@ const _v = new THREE.Vector3();
 
 const FADE_T = 0.35; // seconds for a tile swap cross-fade
 const WIDE = 1.3; // tiles are selected against a frustum this much wider than the view, so turning never exposes unloaded tiles
+const LEAD_T = 1.2; // seconds of camera rotation to look ahead while turning
+const TURN_HOLD = 1.5; // seconds for the measured turn rate to decay
+const MAX_LEAD = 1.0; // radians added to the half field of view at most
+const MAX_HALF_FOV = 1.45; // radians; keeps the wide projection finite
 const SPLIT_HYST = 0.7; // a split tile merges back only below this fraction of the split threshold
 const PREFETCH = 0.8; // children are requested once a tile is this close to its split threshold
 const UPLOAD_BUDGET = 3 * 1048576; // bytes of never-drawn meshes that may enter the scene per frame
@@ -139,8 +143,8 @@ export class World {
     this.opts = opts;
     this.maxZ = opts.maxZ ?? 21;
     this.pxThreshold = opts.pxThreshold ?? 6;
-    this.maxReady = opts.maxReady ?? 5000;
-    this.maxBytes = opts.maxBytes ?? (navigator.deviceMemory >= 8 ? 1100 : 700) * 1048576;
+    this.maxReady = opts.maxReady ?? 8000;
+    this.maxBytes = opts.maxBytes ?? (navigator.deviceMemory >= 8 ? 1400 : 900) * 1048576;
     this.gpuBytes = 0;
     this.maxInflight = opts.maxInflight ?? 24;
     this.keepRadius = 0; // tiles closer than this stay drawn even outside the frustum (shadow casters)
@@ -171,6 +175,8 @@ export class World {
     this.frustumWide = new THREE.Frustum();
     this.projView = new THREE.Matrix4();
     this.projWide = new THREE.Matrix4();
+    this.prevQuat = null;
+    this.turnRate = 0;
     this.stats = { drawn: 0, ready: 0, inflight: 0, wanted: 0, bytes: 0, tris: 0 };
     this.ground = { height: null, z: 0 };
     this.lastEvict = 0;
@@ -414,33 +420,37 @@ export class World {
 
   evict() {
     if (this.ready.size <= this.maxReady && this.gpuBytes <= this.maxBytes) return;
-    // Oldest first; within the same age bucket the finest tiles go first, so a tile is never evicted before its
-    // descendants and a turned-away view keeps its coarse ancestors instead of collapsing to the lowest LOD.
-    const bucket = (n) => Math.floor(n.lastUsed / 30);
-    const old = [...this.ready]
-      .filter((n) => n.lastUsed < this.frame - 5 && n.treeState !== TREES_LOADING && !n.ghost && !n.tf)
-      .sort((a, b) => bucket(a) - bucket(b) || b.z - a.z || a.lastUsed - b.lastUsed);
+    // Finest tiles go first (oldest first within a level) and only leaves are evictable (a tile that still has a loaded
+    // child stays). A turned-away view therefore keeps a coarse-to-mid pyramid and refines in a moment when you turn
+    // back, instead of dropping to the lowest LOD while whole regions reload.
+    const hasReadyKid = (n) => !!n.children && n.children.some((k) => k.state === READY);
     let excess = this.ready.size - Math.floor(this.maxReady * 0.85);
     let overBytes = this.gpuBytes - this.maxBytes * 0.85;
-    for (const n of old) {
-      if (excess <= 0 && overBytes <= 0) break;
-      excess--;
-      overBytes -= n.bytes;
-      this.gpuBytes -= n.bytes;
-      this.group.remove(n.mesh);
-      n.mesh.geometry.dispose();
-      n.mesh = null;
-      n.heights = null;
-      n.collide = null;
-      n.flags = null;
-      n.bytes = 0;
-      n.state = NONE;
-      n.treeState = TREES_NONE;
-      n.shown = false;
-      n.settled = false;
-      n.split = false;
-      n.a = 1;
-      this.ready.delete(n);
+    for (let pass = 0; pass < 8 && (excess > 0 || overBytes > 0); pass++) {
+      const old = [...this.ready]
+        .filter((n) => n.lastUsed < this.frame - 5 && n.treeState !== TREES_LOADING && !n.ghost && !n.tf && !hasReadyKid(n))
+        .sort((a, b) => b.z - a.z || a.lastUsed - b.lastUsed);
+      if (!old.length) break;
+      for (const n of old) {
+        if (excess <= 0 && overBytes <= 0) break;
+        excess--;
+        overBytes -= n.bytes;
+        this.gpuBytes -= n.bytes;
+        this.group.remove(n.mesh);
+        n.mesh.geometry.dispose();
+        n.mesh = null;
+        n.heights = null;
+        n.collide = null;
+        n.flags = null;
+        n.bytes = 0;
+        n.state = NONE;
+        n.treeState = TREES_NONE;
+        n.shown = false;
+        n.settled = false;
+        n.split = false;
+        n.a = 1;
+        this.ready.delete(n);
+      }
     }
   }
 
@@ -470,6 +480,13 @@ export class World {
     return true;
   }
 
+  inFrustum(node, ctx) {
+    _v.copy(node.center).sub(ctx.camPos);
+    _sphere.center.copy(_v);
+    _sphere.radius = node.cullRadius;
+    return this.frustum.intersectsSphere(_sphere);
+  }
+
   select(node, ctx) {
     node.lastUsed = this.frame;
     if (!this.visible(node, ctx)) return;
@@ -492,7 +509,9 @@ export class World {
           k.lastUsed = this.frame;
           if (!this.visible(k, ctx)) continue;
           if (k.state !== READY) {
-            allReady = false;
+            // an already-split node keeps its children while only margin tiles (outside the real view) are still loading,
+            // otherwise turning would collapse whole regions back to the coarse parent
+            if (!(node.split && !this.inFrustum(k, ctx))) allReady = false;
             this.request(k, ctx, !split);
           } else if (!k.mesh.userData.up) {
             cost += k.bytes;
@@ -665,9 +684,19 @@ export class World {
     camera.updateMatrixWorld();
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projView);
+    // The pre-load frustum widens with the camera's angular speed so tiles in the direction of a turn are already loading.
+    const qNow = camera.quaternion;
+    if (this.prevQuat) {
+      const rate = (2 * Math.acos(Math.min(1, Math.abs(this.prevQuat.dot(qNow))))) / this.dt;
+      this.turnRate = Math.max(rate, this.turnRate * Math.exp(-this.dt / TURN_HOLD));
+    }
+    this.prevQuat = (this.prevQuat || new THREE.Quaternion()).copy(qNow);
+    const lead = Math.min(MAX_LEAD, this.turnRate * LEAD_T);
     this.projWide.copy(camera.projectionMatrix);
-    this.projWide.elements[0] /= WIDE;
-    this.projWide.elements[5] /= WIDE;
+    for (const i of [0, 5]) {
+      const e = this.projWide.elements[i];
+      this.projWide.elements[i] = 1 / Math.tan(Math.min(MAX_HALF_FOV, Math.atan(WIDE / e) + lead));
+    }
     this.projWide.multiply(camera.matrixWorldInverse);
     this.frustumWide.setFromProjectionMatrix(this.projWide);
 

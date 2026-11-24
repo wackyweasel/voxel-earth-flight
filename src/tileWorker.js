@@ -1454,26 +1454,30 @@ async function buildTile(z, x, y, withTrees) {
   const vv = [0, 0, 0, 0];
   const aoV = [0, 0, 0, 0];
 
+  // Greedy merging: neighbouring faces that share colour, kind, height and (nearly) AO become one quad.
+  // wuv stays linear in metres across a merged quad, so the shader's patterns are unchanged.
+  // A merged quad is flat, so its span is capped to keep the sag below the chord of the planet's curvature.
+  const maxSpan = Math.max(1, Math.floor(Math.sqrt(8 * R * Math.max(0.3, 0.3 * Q)) / cellM));
+  const AO_TOL = 4;
+  const COL_TOL = 9; // the per-cell brightness jitter baked into colours is about ±3%
+  const aoQ = (a) => (clamp(a, 0, 1) * 255) | 0;
+  const varOf = (k) => (bIdx[k] >= 0 ? bVar[k] : 0);
+  const rndOf = (k) => (bIdx[k] >= 0 ? bRnd[k] : tileRand);
+
+  // top faces: per-vertex AO (self + lower-or-equal neighbours around the corner)
+  const topAO = new Float32Array(GG * 4);
+  const topQ = new Int16Array(GG); // quantised AO when the four corners agree, else -1
   for (let j = 0; j < G; j++) {
     for (let i = 0; i < G; i++) {
       const k = j * G + i;
       const h = Ht[k];
       if (h < minH) minH = h;
       if (h > maxH) maxH = h;
-      const kind = kindTop[k];
-      const isB = bIdx[k] >= 0;
-      const va0 = isB ? bVar[k] : 0;
-      const vb0 = isB ? bRnd[k] : tileRand;
-
-      // top face with per-vertex AO (self + lower-or-equal neighbours around the corner)
-      colC[0] = top[k * 3];
-      colC[1] = top[k * 3 + 1];
-      colC[2] = top[k * 3 + 2];
+      let lo = 255;
+      let hi = 0;
       for (let q = 0; q < 4; q++) {
-        const ci = CORN[q][0];
-        const cj = CORN[q][1];
-        const sdi = ci ? 1 : -1;
-        const sdj = cj ? 1 : -1;
+        const sdi = CORN[q][0] ? 1 : -1;
+        const sdj = CORN[q][1] ? 1 : -1;
         let s = colAO[k];
         let cnt = 1;
         for (let m = 0; m < 3; m++) {
@@ -1486,52 +1490,165 @@ async function buildTile(z, x, y, withTrees) {
             cnt++;
           }
         }
-        aoV[q] = 1 - s / cnt;
-        vv[q] = vert(i + ci, j + cj, h, colC, kind, aoV[q], va0, vb0, (i + ci) * cellM, (j + cj) * cellM);
+        const ao = 1 - s / cnt;
+        topAO[k * 4 + q] = ao;
+        const a8 = aoQ(ao);
+        if (a8 < lo) lo = a8;
+        if (a8 > hi) hi = a8;
       }
-      // corners are a=0, b=1, c=2, d=3; winding a, d, c, b. Split along the diagonal with the smoother AO.
-      if (aoV[0] + aoV[2] >= aoV[1] + aoV[3]) {
+      topQ[k] = hi - lo <= AO_TOL ? aoQ(topAO[k * 4]) : -1;
+    }
+  }
+
+  const sameTop = (k, k2) =>
+    topQ[k2] >= 0 &&
+    Math.abs(topQ[k2] - topQ[k]) <= AO_TOL &&
+    Ht[k2] === Ht[k] &&
+    kindTop[k2] === kindTop[k] &&
+    top[k2 * 3] - top[k * 3] <= COL_TOL &&
+    top[k * 3] - top[k2 * 3] <= COL_TOL &&
+    top[k2 * 3 + 1] - top[k * 3 + 1] <= COL_TOL &&
+    top[k * 3 + 1] - top[k2 * 3 + 1] <= COL_TOL &&
+    top[k2 * 3 + 2] - top[k * 3 + 2] <= COL_TOL &&
+    top[k * 3 + 2] - top[k2 * 3 + 2] <= COL_TOL &&
+    varOf(k2) === varOf(k) &&
+    rndOf(k2) === rndOf(k);
+
+  const topDone = new Uint8Array(GG);
+  for (let j = 0; j < G; j++) {
+    for (let i = 0; i < G; i++) {
+      const k = j * G + i;
+      if (topDone[k]) continue;
+      let w = 1;
+      let hh = 1;
+      if (topQ[k] >= 0) {
+        while (i + w < G && w < maxSpan && !topDone[k + w] && sameTop(k, k + w)) w++;
+        grow: while (j + hh < G && hh < maxSpan) {
+          for (let d = 0; d < w; d++) {
+            const k2 = (j + hh) * G + i + d;
+            if (topDone[k2] || !sameTop(k, k2)) break grow;
+          }
+          hh++;
+        }
+      }
+      for (let dj = 0; dj < hh; dj++) for (let di = 0; di < w; di++) topDone[(j + dj) * G + i + di] = 1;
+
+      const h = Ht[k];
+      const kind = kindTop[k];
+      colC[0] = top[k * 3];
+      colC[1] = top[k * 3 + 1];
+      colC[2] = top[k * 3 + 2];
+      if (w === 1 && hh === 1) {
+        for (let q = 0; q < 4; q++) {
+          aoV[q] = topAO[k * 4 + q];
+          vv[q] = vert(i + CORN[q][0], j + CORN[q][1], h, colC, kind, aoV[q], varOf(k), rndOf(k), (i + CORN[q][0]) * cellM, (j + CORN[q][1]) * cellM);
+        }
+        // corners are a=0, b=1, c=2, d=3; winding a, d, c, b. Split along the diagonal with the smoother AO.
+        if (aoV[0] + aoV[2] >= aoV[1] + aoV[3]) {
+          tri(vv[0], vv[3], vv[2]);
+          tri(vv[0], vv[2], vv[1]);
+        } else {
+          tri(vv[3], vv[2], vv[1]);
+          tri(vv[3], vv[1], vv[0]);
+        }
+      } else {
+        const ao = topAO[k * 4];
+        for (let q = 0; q < 4; q++) {
+          const ci = i + (CORN[q][0] ? w : 0);
+          const cj = j + (CORN[q][1] ? hh : 0);
+          vv[q] = vert(ci, cj, h, colC, kind, ao, varOf(k), rndOf(k), ci * cellM, cj * cellM);
+        }
         tri(vv[0], vv[3], vv[2]);
         tri(vv[0], vv[2], vv[1]);
-      } else {
-        tri(vv[3], vv[2], vv[1]);
-        tri(vv[3], vv[1], vv[0]);
       }
+    }
+  }
 
-      // side walls where the neighbour is lower
-      for (const s of SIDES) {
-        const ni = i + s.di;
-        const nj = j + s.dj;
-        const outside = ni < 0 || nj < 0 || ni >= G || nj >= G;
-        const nk = outside ? -1 : nj * G + ni;
-        const nh = outside ? h - skirt : Ht[nk];
-        if (h <= nh) continue;
-        const p = CORN[s.c[0]];
-        const q = CORN[s.c[1]];
-        let wkind = kind === K_ROAD || kind === K_WATER ? K_TERRAIN : kind;
-        let cols = side;
-        if (isB) {
-          if (nk >= 0 && bIdx[nk] === bIdx[k]) {
-            wkind = K_ROOF; // step inside one building = roof
-            cols = roofCol;
-          } else {
-            wkind = K_WALL;
-          }
+  // side walls where the neighbour is lower, merged along the wall
+  const wallAt = (i, j, s, o) => {
+    const k = j * G + i;
+    const h = Ht[k];
+    const ni = i + s.di;
+    const nj = j + s.dj;
+    const outside = ni < 0 || nj < 0 || ni >= G || nj >= G;
+    const nk = outside ? -1 : nj * G + ni;
+    const nh = outside ? h - skirt : Ht[nk];
+    if (h <= nh) return false;
+    const kind = kindTop[k];
+    const isB = bIdx[k] >= 0;
+    let wkind = kind === K_ROAD || kind === K_WATER ? K_TERRAIN : kind;
+    let cols = side;
+    if (isB) {
+      if (nk >= 0 && bIdx[nk] === bIdx[k]) {
+        wkind = K_ROOF; // step inside one building = roof
+        cols = roofCol;
+      } else {
+        wkind = K_WALL;
+      }
+    }
+    o.h = h;
+    o.nh = nh;
+    o.base = isB ? bBase[k] : nh;
+    o.kind = wkind;
+    o.r = cols[k * 3];
+    o.g = cols[k * 3 + 1];
+    o.b = cols[k * 3 + 2];
+    o.va = varOf(k);
+    o.vb = rndOf(k);
+    o.ao = aoQ(outside ? 1 : 1 - Math.min(0.85, colAO[nk] + Math.min(0.3, (h - nh) * 0.03)));
+    return true;
+  };
+  const wa = {};
+  const wb = {};
+  for (const s of SIDES) {
+    const horiz = s.di !== 0;
+    const p = CORN[s.c[0]];
+    const q = CORN[s.c[1]];
+    const ascending = horiz ? q[1] > p[1] : q[0] > p[0];
+    for (let o = 0; o < G; o++) {
+      let t = 0;
+      while (t < G) {
+        if (!wallAt(horiz ? o : t, horiz ? t : o, s, wa)) {
+          t++;
+          continue;
         }
-        colC[0] = cols[k * 3];
-        colC[1] = cols[k * 3 + 1];
-        colC[2] = cols[k * 3 + 2];
-        const horiz = s.di !== 0;
-        const base = isB ? bBase[k] : nh;
-        const lowAO = outside ? 1 : 1 - Math.min(0.85, colAO[nk] + Math.min(0.3, (h - nh) * 0.03));
-        const u0 = (horiz ? j + p[1] : i + p[0]) * cellM;
-        const u1 = (horiz ? j + q[1] : i + q[0]) * cellM;
-        const w0 = vert(i + p[0], j + p[1], nh, colC, wkind, lowAO, va0, vb0, u0, nh - base);
-        const w1 = vert(i + q[0], j + q[1], nh, colC, wkind, lowAO, va0, vb0, u1, nh - base);
-        const w2 = vert(i + q[0], j + q[1], h, colC, wkind, 1, va0, vb0, u1, h - base);
-        const w3 = vert(i + p[0], j + p[1], h, colC, wkind, 1, va0, vb0, u0, h - base);
+        let t1 = t;
+        while (t1 + 1 < G && t1 - t + 1 < maxSpan) {
+          if (!wallAt(horiz ? o : t1 + 1, horiz ? t1 + 1 : o, s, wb)) break;
+          if (
+            Math.abs(wb.h - wa.h) > 1e-4 ||
+            Math.abs(wb.nh - wa.nh) > 1e-4 ||
+            Math.abs(wb.base - wa.base) > 1e-4 ||
+            wb.kind !== wa.kind ||
+            Math.abs(wb.r - wa.r) > COL_TOL ||
+            Math.abs(wb.g - wa.g) > COL_TOL ||
+            Math.abs(wb.b - wa.b) > COL_TOL ||
+            wb.va !== wa.va ||
+            wb.vb !== wa.vb ||
+            Math.abs(wb.ao - wa.ao) > AO_TOL
+          )
+            break;
+          t1++;
+        }
+        const tp = ascending ? t : t1;
+        const tq = ascending ? t1 : t;
+        const pi = horiz ? o + p[0] : tp + p[0];
+        const pj = horiz ? tp + p[1] : o + p[1];
+        const qi = horiz ? o + q[0] : tq + q[0];
+        const qj = horiz ? tq + q[1] : o + q[1];
+        const u0 = (horiz ? pj : pi) * cellM;
+        const u1 = (horiz ? qj : qi) * cellM;
+        colC[0] = wa.r;
+        colC[1] = wa.g;
+        colC[2] = wa.b;
+        const lowAO = (wa.ao + 0.5) / 255;
+        const w0 = vert(pi, pj, wa.nh, colC, wa.kind, lowAO, wa.va, wa.vb, u0, wa.nh - wa.base);
+        const w1 = vert(qi, qj, wa.nh, colC, wa.kind, lowAO, wa.va, wa.vb, u1, wa.nh - wa.base);
+        const w2 = vert(qi, qj, wa.h, colC, wa.kind, 1, wa.va, wa.vb, u1, wa.h - wa.base);
+        const w3 = vert(pi, pj, wa.h, colC, wa.kind, 1, wa.va, wa.vb, u0, wa.h - wa.base);
         tri(w0, w1, w2);
         tri(w0, w2, w3);
+        t = t1 + 1;
       }
     }
   }
