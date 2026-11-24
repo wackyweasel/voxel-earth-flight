@@ -74,6 +74,7 @@ class TileNode {
     this.lockUntil = 0; // no LOD change before this time (lets a cross-fade finish)
     this.a = 1; // fade-in level while the tile is being swapped in
     this.shown = false;
+    this.settled = false; // has been fully faded in before; returning to view then needs no fade
     this.ghost = false;
     this.drawFrame = -1;
     this.coverFrame = -1;
@@ -139,7 +140,7 @@ export class World {
     this.maxZ = opts.maxZ ?? 21;
     this.pxThreshold = opts.pxThreshold ?? 6;
     this.maxReady = opts.maxReady ?? 5000;
-    this.maxBytes = opts.maxBytes ?? 700 * 1048576;
+    this.maxBytes = opts.maxBytes ?? (navigator.deviceMemory >= 8 ? 1100 : 700) * 1048576;
     this.gpuBytes = 0;
     this.maxInflight = opts.maxInflight ?? 24;
     this.keepRadius = 0; // tiles closer than this stay drawn even outside the frustum (shadow casters)
@@ -413,9 +414,12 @@ export class World {
 
   evict() {
     if (this.ready.size <= this.maxReady && this.gpuBytes <= this.maxBytes) return;
+    // Oldest first; within the same age bucket the finest tiles go first, so a tile is never evicted before its
+    // descendants and a turned-away view keeps its coarse ancestors instead of collapsing to the lowest LOD.
+    const bucket = (n) => Math.floor(n.lastUsed / 30);
     const old = [...this.ready]
       .filter((n) => n.lastUsed < this.frame - 5 && n.treeState !== TREES_LOADING && !n.ghost && !n.tf)
-      .sort((a, b) => a.lastUsed - b.lastUsed);
+      .sort((a, b) => bucket(a) - bucket(b) || b.z - a.z || a.lastUsed - b.lastUsed);
     let excess = this.ready.size - Math.floor(this.maxReady * 0.85);
     let overBytes = this.gpuBytes - this.maxBytes * 0.85;
     for (const n of old) {
@@ -433,6 +437,7 @@ export class World {
       n.state = NONE;
       n.treeState = TREES_NONE;
       n.shown = false;
+      n.settled = false;
       n.split = false;
       n.a = 1;
       this.ready.delete(n);
@@ -532,15 +537,19 @@ export class World {
     const step = this.dt / FADE_T;
     const fade = !!this.fadeMaterial;
 
+    const entering = [];
+    const replacing = new Set();
     for (const n of this.drawn) {
       if (!n.shown) {
         n.shown = true;
         n.lockUntil = this.nowS + FADE_T;
         n.a = fade ? 0 : 1;
         n.ghost = false;
+        entering.push(n);
         for (let p = n.parent; p; p = p.parent) {
           p.coverFrame = frame;
           p.coverNode = n;
+          if (p.shown && p.drawFrame !== frame) replacing.add(n);
         }
       }
     }
@@ -552,6 +561,7 @@ export class World {
         n.shown = false;
         let cover = n.coverFrame === frame ? n.coverNode : null;
         for (let p = n.parent; !cover && p; p = p.parent) if (p.drawFrame === frame) cover = p;
+        if (cover) replacing.add(cover);
         if (cover && cover.a < 1 && n.mesh) {
           n.ghost = true;
           this.ghosts.push({ node: n, cover });
@@ -560,6 +570,9 @@ export class World {
     } else {
       for (const n of prev) if (n.drawFrame !== frame) n.shown = false;
     }
+
+    // a tile that merely re-enters the view (it replaces nothing) shows at once instead of dissolving in over the coarse globe
+    for (const n of entering) if (n.settled && !replacing.has(n)) n.a = 1;
 
     for (const n of this.drawn) {
       const m = n.mesh;
@@ -577,6 +590,7 @@ export class World {
       } else if (m.material !== this.material) {
         m.material = this.material;
       }
+      if (n.a >= 1) n.settled = true;
       m.userData.up = true;
     }
 
