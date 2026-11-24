@@ -1,0 +1,718 @@
+import * as THREE from 'three';
+import { R, llToDir, llToMerc, dirToLat, dirToLon } from './geo.js';
+import { Flight } from './flight.js';
+import { World } from './world.js';
+import { createPlane, GEAR_DROP } from './plane.js';
+import { Walker } from './walker.js';
+import { Skydiver, HIP } from './skydiver.js';
+import { Shadows } from './shadows.js';
+import { Bloom } from './bloom.js';
+import { env, shared, createVoxelMaterial, createSky, createAtmosphere, createSkyLUT, CLOUD_PERIOD } from './materials.js';
+
+const PRESETS = [
+  { name: 'Orbit view', lat: 20, lon: -40, alt: 11_000_000, heading: 0, pitch: -80 },
+  { name: 'New York', lat: 40.7484, lon: -73.9857, alt: 500, heading: 200, pitch: -6 },
+  { name: 'Paris', lat: 48.8584, lon: 2.2945, alt: 450, heading: 90, pitch: -6 },
+  { name: 'Tokyo', lat: 35.6595, lon: 139.7005, alt: 600, heading: 270, pitch: -6 },
+  { name: 'Dubai', lat: 25.1972, lon: 55.2744, alt: 700, heading: 0, pitch: -6 },
+  { name: 'San Francisco', lat: 37.8087, lon: -122.4098, alt: 500, heading: 180, pitch: -6 },
+  { name: 'Mount Everest', lat: 27.9881, lon: 86.925, alt: 9500, heading: 250, pitch: -4 },
+  { name: 'Alps (Matterhorn)', lat: 45.9763, lon: 7.6586, alt: 5200, heading: 60, pitch: -4 },
+  { name: 'Grand Canyon', lat: 36.1069, lon: -112.1129, alt: 3200, heading: 90, pitch: -4 },
+  { name: 'SFO approach', lat: 37.5985, lon: -122.31, alt: 450, heading: 285, pitch: -3 },
+  { name: 'Montréal', lat: 45.5017, lon: -73.5673, alt: 500, heading: 45, pitch: -6 },
+];
+
+const WALK_PRESETS = [
+  { name: 'Times Square', lat: 40.75795, lon: -73.98555, heading: 0 },
+  { name: 'Eiffel Tower', lat: 48.85605, lon: 2.29365, heading: 135 },
+  { name: 'Shibuya Crossing', lat: 35.65950, lon: 139.70065, heading: 20 },
+  { name: 'Sydney Opera House', lat: -33.85735, lon: 151.21525, heading: 0 },
+  { name: 'Old Montréal', lat: 45.50735, lon: -73.55395, heading: 330 },
+  { name: 'Burj Khalifa', lat: 25.19535, lon: 55.27425, heading: 90 },
+];
+
+const QUALITY = { Low: 14, Medium: 8, High: 5, Ultra: 3.5 };
+const DEFAULT_QUALITY = 'High';
+const JUMP_MIN_AGL = 250; // metres above ground needed to jump
+
+// --- renderer / scene -----------------------------------------------------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  antialias: true,
+  logarithmicDepthBuffer: true,
+  powerPreference: 'high-performance',
+});
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // shaders output sRGB-encoded values themselves
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.autoClear = true;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(65, 1, 0.5, 1e8);
+camera.layers.enable(1); // sky, atmosphere, base sphere and caps live on layer 1 (they cast no shadows)
+
+const skyLUT = createSkyLUT();
+const shadows = new Shadows();
+const bloom = new Bloom();
+const sky = createSky();
+scene.add(sky);
+const atmosphere = createAtmosphere();
+scene.add(atmosphere);
+
+const voxelMat = createVoxelMaterial();
+const world = new World(scene, {
+  material: voxelMat,
+  fadeMaterial: createVoxelMaterial(THREE.FrontSide, true),
+  capMaterial: createVoxelMaterial(THREE.DoubleSide),
+  maxZ: 20,
+  pxThreshold: QUALITY[DEFAULT_QUALITY],
+});
+
+const plane = createPlane(voxelMat);
+scene.add(plane);
+const diver = new Skydiver(voxelMat);
+scene.add(diver.body, diver.canopy);
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// --- state ------------------------------------------------------------------
+const flight = new Flight();
+const walker = new Walker();
+let mode = 'fly'; // 'fly' | 'walk' | 'chute'
+let paused = true;
+let planeScale = 1;
+let planeGone = false; // the plane was left behind in the air; P calls it back
+let chase = true;
+let sunLon = 0;
+let tod = 15; // local solar hour at the player, kept across teleports
+const DAY_CYCLES = { Off: 0, 'Slow (30 min)': 0.2, 'Normal (8 min)': 0.75, 'Fast (2 min)': 3 }; // sun degrees of longitude per second
+const DEFAULT_CYCLE = 'Normal (8 min)';
+let dayRate = DAY_CYCLES[DEFAULT_CYCLE];
+let lastRate = dayRate;
+let notice = null; // { text, until } transient HUD warning
+let settle = null; // { t } while waiting for ground tiles to stream in under a freshly placed walker
+let lastUnlock = 0;
+const camQuat = new THREE.Quaternion();
+const chuteGround = { h: 0, water: 0 };
+const NO_INPUT = { pitch: 0, roll: 0, yaw: 0 };
+const planeQuat = new THREE.Quaternion();
+const camPos = new THREE.Vector3();
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
+const _c = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const pitchDown = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -0.1);
+let camInit = false;
+
+function sampleAt(dir) {
+  const m = llToMerc(dirToLat(dir.x, dir.y, dir.z), dirToLon(dir.x, dir.z));
+  return world.sample(m.u, m.v);
+}
+
+function currentLon() {
+  return mode === 'fly' ? flight.lon : mode === 'chute' ? diver.lon : walker.lon;
+}
+
+const wrap24 = (h) => ((h % 24) + 24) % 24;
+const localHour = () => wrap24(12 + (currentLon() - sunLon) / 15);
+const sunLonFor = (lon, hour) => lon - (hour - 12) * 15;
+
+function showNotice(text, secs = 3) {
+  notice = { text, until: performance.now() + secs * 1000 };
+}
+
+function spawn(p) {
+  if (p.ground) return startOnFoot(p);
+  mode = 'fly';
+  settle = null;
+  planeGone = false;
+  diver.hide();
+  document.exitPointerLock?.();
+  flight.spawn(p.lat, p.lon, p.alt, p.heading, p.pitch);
+  flight.throttle = 0.45;
+  flight.speed = 0;
+  planeScale = Math.max(1, p.alt / 1200);
+  sunLon = sunLonFor(p.lon, tod);
+  camInit = false;
+}
+
+function startOnFoot(p) {
+  flight.spawn(p.lat, p.lon, 0, p.heading, 0);
+  flight.speed = 0;
+  flight.throttle = 0;
+  walker.place(_a.copy(flight.p).normalize(), flight.f, 0);
+  mode = 'walk';
+  settle = { t: 0 };
+  planeScale = 1;
+  planeGone = false;
+  diver.hide();
+  sunLon = sunLonFor(p.lon, tod);
+  camInit = false;
+}
+
+// Leaves the plane in mid-air; the plane keeps flying on its own.
+function startChute() {
+  const exit = _b.copy(flight.r).multiplyScalar(3.5 * planeScale).add(flight.p);
+  _c.copy(flight.f).multiplyScalar(flight.speed);
+  diver.start(exit, flight.f, _c);
+  mode = 'chute';
+  camInit = false;
+  canvas.requestPointerLock?.()?.catch?.(() => {});
+}
+
+function touchdown(res) {
+  if (res.water) {
+    // no swimming: put the player back in a plane over the same spot
+    showNotice('Splashdown! Back in the plane.', 4);
+    spawn({ lat: diver.lat, lon: diver.lon, alt: 600, heading: diver.headingDeg, pitch: -3 });
+    return;
+  }
+  const speed = res.speed;
+  walker.place(_a.copy(diver.p).normalize(), diver.f, diver.alt - HIP);
+  diver.hide();
+  mode = 'walk';
+  settle = { t: 0, keepPlane: true };
+  planeGone = true;
+  planeScale = 1;
+  camInit = false;
+  if (speed > 9) showNotice('HARD LANDING', 3);
+}
+
+// Puts the plane on the ground a few metres ahead of the walker.
+function parkPlaneAhead(dist) {
+  const dir = _b.copy(walker.n).multiplyScalar(R).addScaledVector(walker.f, dist).normalize();
+  const s = sampleAt(dir);
+  const h = s ? s.h : walker.foot;
+  const pos = _c.copy(dir).multiplyScalar(R + h + GEAR_DROP);
+  flight.park(pos, walker.f, dir);
+  planeGone = false;
+}
+
+function exitPlane() {
+  const side = _b.copy(flight.r).multiplyScalar(9);
+  const dir = _c.copy(flight.p).normalize().multiplyScalar(R).add(side).normalize();
+  const s = sampleAt(dir);
+  const h = s && !s.water ? s.h : flight.alt - GEAR_DROP;
+  walker.place(dir, flight.f, h);
+  flight.speed = 0;
+  mode = 'walk';
+  camInit = false;
+  canvas.requestPointerLock?.()?.catch?.(() => {});
+}
+
+function nearPlane() {
+  return !planeGone && _a.copy(walker.n).multiplyScalar(R + walker.foot).distanceTo(flight.p) < 16;
+}
+
+function boardPlane() {
+  mode = 'fly';
+  flight.throttle = 0;
+  flight.speed = 0;
+  camInit = false;
+  document.exitPointerLock?.();
+}
+
+function sunDirection() {
+  const now = new Date();
+  const doy = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(now.getUTCFullYear(), 0, 0)) / 864e5;
+  const dec = -23.44 * Math.cos(((2 * Math.PI) / 365) * (doy + 10));
+  return llToDir(dec, sunLon);
+}
+
+// --- input ---------------------------------------------------------------------
+const keys = new Set();
+const typing = () => document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.type !== 'checkbox';
+
+window.addEventListener('keydown', (e) => {
+  if (typing()) return;
+  if (e.code === 'Escape') {
+    // Esc while pointer-locked already released the lock and opened the menu
+    if (performance.now() - lastUnlock < 200) return;
+    toggleMenu();
+    return;
+  }
+  if (e.code === 'KeyM') {
+    toggleMenu();
+    return;
+  }
+  if (paused) return;
+  keys.add(e.code);
+  if (e.repeat) return;
+  switch (e.code) {
+    case 'Enter':
+      if (mode === 'fly') {
+        if (flight.landed) exitPlane();
+      } else if (mode === 'walk' && !settle && nearPlane()) {
+        boardPlane();
+      }
+      break;
+    case 'KeyJ':
+      if (mode === 'fly' && !flight.grounded && flight.alt - (world.ground.height ?? 0) > JUMP_MIN_AGL) startChute();
+      break;
+    case 'Space':
+      if (mode === 'chute') diver.deploy();
+      break;
+    case 'KeyP':
+      if (mode === 'walk' && !settle) parkPlaneAhead(14);
+      break;
+    case 'KeyC':
+      chase = !chase;
+      break;
+    case 'KeyI':
+      flight.invertPitch = !flight.invertPitch;
+      break;
+    case 'KeyL':
+      flight.autoLevel = !flight.autoLevel;
+      break;
+    case 'KeyT':
+      if (dayRate) {
+        lastRate = dayRate;
+        dayRate = 0;
+      } else {
+        dayRate = lastRate || DAY_CYCLES[DEFAULT_CYCLE];
+      }
+      syncCycleSelect();
+      break;
+    case 'BracketLeft':
+      sunLon += 15;
+      break;
+    case 'BracketRight':
+      sunLon -= 15;
+      break;
+    case 'KeyG':
+      e.preventDefault();
+      showSearch();
+      break;
+    case 'KeyH':
+      document.getElementById('help').classList.toggle('hidden');
+      break;
+  }
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+});
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => keys.clear());
+window.addEventListener(
+  'wheel',
+  (e) => {
+    if (paused || mode !== 'fly') return;
+    flight.throttle = Math.min(1, Math.max(0, flight.throttle - e.deltaY * 0.0004));
+  },
+  { passive: true },
+);
+
+const locked = () => document.pointerLockElement === canvas;
+window.addEventListener('mousemove', (e) => {
+  if (paused || settle || !locked()) return;
+  if (mode === 'walk') walker.turn(e.movementX * 0.0022, -e.movementY * 0.0022);
+  else if (mode === 'chute') diver.turn(e.movementX * 0.0022, -e.movementY * 0.0022);
+});
+document.addEventListener('pointerlockchange', () => {
+  if (locked()) return;
+  lastUnlock = performance.now();
+  if (mode !== 'fly' && !paused) toggleMenu(true);
+});
+canvas.addEventListener('click', () => {
+  if (mode !== 'fly' && !paused && !locked()) canvas.requestPointerLock?.()?.catch?.(() => {});
+});
+
+function readFlightInput(dt) {
+  const k = (c) => (keys.has(c) ? 1 : 0);
+  if (k('ShiftLeft') || k('ShiftRight') || k('KeyR') || k('Equal')) flight.throttle = Math.min(1, flight.throttle + dt * 0.35);
+  if (k('ControlLeft') || k('ControlRight') || k('KeyF') || k('Minus')) flight.throttle = Math.max(0, flight.throttle - dt * 0.35);
+  return {
+    pitch: k('KeyS') + k('ArrowDown') - k('KeyW') - k('ArrowUp'),
+    roll: k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft'),
+    yaw: k('KeyE') - k('KeyQ'),
+  };
+}
+
+function readWalkInput(dt) {
+  const k = (c) => (keys.has(c) ? 1 : 0);
+  walker.turn((k('ArrowRight') - k('ArrowLeft')) * 1.8 * dt, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt);
+  return {
+    fwd: k('KeyW') - k('KeyS'),
+    strafe: k('KeyD') - k('KeyA'),
+    sprint: k('ShiftLeft') || k('ShiftRight'),
+    jump: k('Space'),
+  };
+}
+
+function readChuteInput(dt) {
+  const k = (c) => (keys.has(c) ? 1 : 0);
+  const turn = k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft');
+  diver.turn(turn * 1.3 * dt, (k('ArrowUp') - k('ArrowDown')) * 1.2 * dt);
+  return { fwd: k('KeyW') - k('KeyS'), turn };
+}
+
+// --- UI -------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const menu = $('menu');
+
+function toggleMenu(show) {
+  const want = show ?? !menu.classList.contains('open');
+  menu.classList.toggle('open', want);
+  paused = want;
+  keys.clear();
+  if (want) document.exitPointerLock?.();
+  else if (mode !== 'fly') canvas.requestPointerLock?.()?.catch?.(() => {});
+}
+
+function buildMenu() {
+  const add = (parent, list, extra) => {
+    for (const p of list) {
+      const b = document.createElement('button');
+      b.textContent = p.name;
+      b.onclick = () => {
+        spawn({ ...p, ...extra });
+        toggleMenu(false);
+      };
+      $(parent).appendChild(b);
+    }
+  };
+  add('presets', PRESETS);
+  add('walk-presets', WALK_PRESETS, { ground: true });
+  const q = $('quality');
+  for (const name of Object.keys(QUALITY)) q.add(new Option(name, name, false, name === DEFAULT_QUALITY));
+  q.onchange = () => {
+    world.pxThreshold = QUALITY[q.value];
+  };
+  $('shadows').onchange = (e) => {
+    shadows.enabled = e.target.checked;
+  };
+  const dc = $('daycycle');
+  for (const name of Object.keys(DAY_CYCLES)) dc.add(new Option(name, name, false, name === DEFAULT_CYCLE));
+  dc.onchange = () => {
+    dayRate = DAY_CYCLES[dc.value];
+    if (dayRate) lastRate = dayRate;
+  };
+  $('tod').oninput = (e) => {
+    sunLon = sunLonFor(currentLon(), parseFloat(e.target.value));
+    tod = localHour();
+  };
+  $('resume').onclick = () => toggleMenu(false);
+  $('menu-search-go').onclick = () => geocode($('menu-search').value, true);
+  $('menu-search').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') geocode($('menu-search').value, true);
+  });
+}
+
+function showSearch() {
+  const box = $('search');
+  box.classList.add('open');
+  const input = $('search-input');
+  input.value = '';
+  input.focus();
+  keys.clear();
+}
+
+function hideSearch() {
+  $('search').classList.remove('open');
+  $('search-input').blur();
+}
+
+async function geocode(query, fromMenu) {
+  query = query.trim();
+  if (!query) return;
+  const status = $(fromMenu ? 'menu-status' : 'search-status');
+  status.textContent = 'Searching…';
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`);
+    const [hit] = await res.json();
+    if (!hit) {
+      status.textContent = 'No match found';
+      return;
+    }
+    const heading = mode === 'fly' ? flight.headingDeg || 0 : mode === 'chute' ? diver.headingDeg : walker.headingDeg;
+    spawn({ lat: +hit.lat, lon: +hit.lon, alt: 700, heading, pitch: -8 });
+    status.textContent = hit.display_name;
+    hideSearch();
+    toggleMenu(false);
+  } catch (e) {
+    status.textContent = 'Search failed';
+  }
+}
+
+$('search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') geocode(e.target.value, false);
+  if (e.key === 'Escape') hideSearch();
+  e.stopPropagation();
+});
+buildMenu();
+
+const hud = {
+  speed: $('h-speed'),
+  alt: $('h-alt'),
+  agl: $('h-agl'),
+  pos: $('h-pos'),
+  hdg: $('h-hdg'),
+  time: $('h-time'),
+  thr: $('h-thr'),
+  tiles: $('h-tiles'),
+  net: $('h-net'),
+  warn: $('h-warn'),
+  prompt: $('prompt'),
+  cross: $('crosshair'),
+};
+
+function fmtDist(m) {
+  if (m >= 1e6) return `${(m / 1000).toFixed(0)} km`;
+  if (m >= 1e4) return `${(m / 1000).toFixed(1)} km`;
+  return `${m.toFixed(0)} m`;
+}
+
+function fmtHour(h) {
+  const m = Math.floor(h * 60 + 0.5) % 1440;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function syncCycleSelect() {
+  const name = Object.keys(DAY_CYCLES).find((k) => DAY_CYCLES[k] === dayRate) ?? Object.keys(DAY_CYCLES)[0];
+  $('daycycle').value = name;
+}
+
+let hudTimer = 0;
+let fps = 60;
+function updateHud(dt, agl) {
+  hudTimer += dt;
+  if (hudTimer < 0.1) return;
+  hudTimer = 0;
+  const st = world.stats;
+  let warn = '';
+  if (mode === 'fly') {
+    const s = flight.speed;
+    hud.speed.textContent = s >= 1000 ? `${(s / 1000).toFixed(1)} km/s` : `${(s * 3.6).toFixed(0)} km/h`;
+    hud.alt.textContent = fmtDist(flight.alt);
+    hud.agl.textContent = fmtDist(agl);
+    hud.pos.textContent = `${flight.lat.toFixed(4)}°, ${flight.lon.toFixed(4)}°`;
+    hud.hdg.textContent = `${flight.headingDeg.toFixed(0)}°  pitch ${flight.pitchDeg.toFixed(0)}°`;
+    hud.thr.style.width = `${(flight.throttle * 100).toFixed(0)}%`;
+    if (flight.crashed) warn = 'HARD LANDING';
+    hud.prompt.textContent = flight.landed
+      ? '[Enter] Exit plane'
+      : flight.grounded
+        ? 'Throttle to zero to park'
+        : agl > JUMP_MIN_AGL
+          ? '[J] Jump with parachute'
+          : '';
+  } else if (mode === 'chute') {
+    hud.speed.textContent = `${(-diver.vy * 3.6).toFixed(0)} km/h down · ${(diver.hv.length() * 3.6).toFixed(0)} across`;
+    hud.alt.textContent = fmtDist(diver.alt);
+    hud.agl.textContent = fmtDist(Math.max(0, diver.agl));
+    hud.pos.textContent = `${diver.lat.toFixed(5)}°, ${diver.lon.toFixed(5)}°`;
+    hud.hdg.textContent = `${diver.headingDeg.toFixed(0)}°`;
+    hud.thr.style.width = '0%';
+    hud.prompt.textContent = !diver.deployed
+      ? '[Space] Open parachute · W dive · S arch'
+      : diver.flying
+        ? 'W/S speed · A/D steer · mouse look'
+        : 'Canopy opening…';
+  } else {
+    hud.speed.textContent = 'on foot';
+    hud.alt.textContent = fmtDist(walker.foot);
+    hud.agl.textContent = '–';
+    hud.pos.textContent = `${walker.lat.toFixed(5)}°, ${walker.lon.toFixed(5)}°`;
+    hud.hdg.textContent = `${walker.headingDeg.toFixed(0)}°`;
+    hud.thr.style.width = '0%';
+    hud.prompt.textContent = settle
+      ? 'Loading terrain…'
+      : nearPlane()
+        ? '[Enter] Board plane'
+        : '[P] Call plane · click to look around';
+  }
+  if (notice && performance.now() < notice.until) warn = notice.text;
+  hud.warn.textContent = warn;
+  hud.warn.classList.toggle('on', !!warn);
+  hud.time.textContent = fmtHour(localHour());
+  if (document.activeElement !== $('tod')) {
+    $('tod').value = localHour();
+    $('tod-label').textContent = fmtHour(localHour());
+  }
+  hud.cross.classList.toggle('on', mode === 'walk' && !paused);
+  hud.tiles.textContent = `${st.drawn} drawn · ${st.ready} cached · ${st.inflight} loading${st.trees ? ` (${st.trees} tree passes)` : ''} · z${world.ground.z} · ${(st.tris / 1e6).toFixed(2)}M tris · ${fps.toFixed(0)} fps`;
+  hud.net.textContent = `${(st.bytes / 1048576).toFixed(1)} MB streamed · ${st.mb.toFixed(0)} MB GPU`;
+}
+
+// --- main loop ---------------------------------------------------------------------
+spawn(PRESETS[0]);
+toggleMenu(true);
+
+const smooth = THREE.MathUtils.smoothstep;
+let lastT = performance.now();
+const t0 = lastT;
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const rawDt = (now - lastT) / 1000;
+  lastT = now;
+  const dt = Math.min(0.05, rawDt);
+  if (rawDt > 0) fps += (1 / rawDt - fps) * 0.05;
+  if (dayRate && !paused) sunLon -= dt * dayRate;
+  const sd = sunDirection();
+  env.sun.set(sd[0], sd[1], sd[2]);
+  env.moon.set(-sd[0], -sd[1] + 0.3, -sd[2]).normalize();
+  tod = localHour();
+
+  // --- simulate ---
+  const ground = world.ground.height;
+  let agl;
+  let chuteTurn = 0;
+  if (mode === 'fly') {
+    if (!paused) flight.update(dt, readFlightInput(dt), planeScale, ground, GEAR_DROP);
+    else flight.speed = 0;
+    agl = flight.alt - (ground ?? 0);
+    const targetScale = Math.max(1, agl / 1200);
+    planeScale *= Math.pow(targetScale / planeScale, Math.min(1, dt * 3));
+  } else if (mode === 'chute') {
+    const gs = sampleAt(_c.copy(diver.p).normalize());
+    chuteGround.h = gs ? (gs.water ? Math.max(gs.h, 0) : gs.h) : 0;
+    chuteGround.water = gs ? gs.water : 0;
+    if (!paused) {
+      const input = readChuteInput(dt);
+      chuteTurn = input.turn;
+      const res = diver.update(dt, input, chuteGround);
+      // the abandoned plane flies on by itself
+      const pg = sampleAt(_c.copy(flight.p).normalize());
+      flight.update(dt, NO_INPUT, planeScale, pg ? pg.h : 0, GEAR_DROP);
+      if (res) touchdown(res);
+    }
+    agl = Math.max(1.7, diver.agl);
+    planeScale += (1 - planeScale) * Math.min(1, dt * 3);
+  } else {
+    if (settle) {
+      // hold the player in place until fine tiles exist, then drop them onto the real ground
+      settle.t += dt;
+      const m = llToMerc(walker.lat, walker.lon);
+      const s = world.sample(m.u, m.v);
+      if (s) walker.foot = walker.smoothFoot = s.z >= 20 ? s.h : Math.max(s.h, 0);
+      if ((s && s.z >= 20) || settle.t > 12) {
+        if (s) {
+          const keepPlane = settle.keepPlane;
+          settle = null;
+          if (!keepPlane) parkPlaneAhead(14);
+        } else if (settle.t > 40) settle = null;
+      }
+    } else if (!paused) {
+      walker.update(dt, readWalkInput(dt), world);
+    }
+    agl = 1.7;
+    planeScale += (1 - planeScale) * Math.min(1, dt * 3);
+  }
+  const s = planeScale;
+
+  // --- camera rig ---
+  flight.basisQuaternion(planeQuat);
+  if (mode === 'fly') {
+    if (!camInit) {
+      camQuat.copy(planeQuat);
+      camInit = true;
+    } else {
+      camQuat.slerp(planeQuat, 1 - Math.exp(-dt * 6));
+    }
+    _q.copy(camQuat);
+    if (chase) {
+      _a.set(0, 6 * s, 22 * s).applyQuaternion(camQuat);
+      camPos.copy(flight.p).add(_a);
+      _q.multiply(pitchDown);
+    } else {
+      _a.set(0, 1.4 * s, -1.5 * s).applyQuaternion(camQuat);
+      camPos.copy(flight.p).add(_a);
+    }
+    camera.near = Math.max(0.3, 0.4 * s);
+    camera.fov = 65;
+  } else if (mode === 'chute') {
+    diver.cameraRig(camPos, _q, chuteGround.h);
+    camera.near = 0.2;
+    camera.fov = 70;
+  } else {
+    walker.eyePosition(camPos);
+    walker.basisQuaternion(_q);
+    camera.near = 0.1;
+    camera.fov = 72;
+  }
+  camera.position.set(0, 0, 0);
+  camera.quaternion.copy(_q);
+  camera.far = 1e8;
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld();
+
+  plane.visible = !planeGone && (mode !== 'fly' || chase);
+  plane.position.copy(flight.p).sub(camPos);
+  plane.quaternion.copy(planeQuat);
+  plane.scale.setScalar(s);
+  plane.userData.update(dt, mode === 'fly' ? flight.throttle : 0);
+  if (mode === 'chute') diver.syncMeshes(camPos, chuteTurn, dt);
+  else diver.hide();
+
+  // --- lighting uniforms ---
+  const camUp = _a.copy(camPos).normalize();
+  const camAlt = camPos.length() - R;
+  const sunUp = camUp.dot(env.sun);
+  const nightF = (1 - smooth(sunUp, -0.22, 0.04)) * (1 - smooth(camAlt, 20000, 120000));
+  shared.uExposure.value = 0.9 + 0.9 * nightF;
+  env.camPos.copy(camPos);
+  shared.uUpC.value.copy(camUp);
+  shared.uSunH.value.copy(env.sun).addScaledVector(camUp, -sunUp);
+  if (shared.uSunH.value.lengthSq() < 1e-8) shared.uSunH.value.crossVectors(camUp, _b.set(0, 1, 0));
+  if (shared.uSunH.value.lengthSq() < 1e-8) shared.uSunH.value.crossVectors(camUp, _b.set(1, 0, 0));
+  shared.uSunH.value.normalize();
+  shared.uSunE.value.crossVectors(camUp, shared.uSunH.value);
+  shared.uCamAlt.value = camAlt;
+  shared.uTime.value = (now - t0) / 1000;
+  shared.uUseTrue.value = smooth(camAlt, 25000, 100000);
+
+  const su = sky.material.uniforms;
+  su.uInvProj.value.copy(camera.projectionMatrix).invert();
+  su.uCamWorld.value.copy(camera.matrixWorld);
+  su.uSpace.value = smooth(camAlt, 60000, 150000);
+  su.uCloud.value = 1 - smooth(camAlt, 1800, 2800);
+  {
+    const wt = (now - t0) / 1000;
+    const wrap = (v) => ((v % CLOUD_PERIOD) + CLOUD_PERIOD) % CLOUD_PERIOD;
+    su.uCloudO.value.set(wrap(camPos.x + wt * 5.0), wrap(camPos.y + wt * 1.5), wrap(camPos.z + wt * 3.0));
+  }
+  atmosphere.position.copy(camPos).negate();
+  atmosphere.material.uniforms.uFade.value = THREE.MathUtils.clamp((camAlt - 40000) / 150000, 0, 1);
+
+  // --- stream world ---
+  const shScale = THREE.MathUtils.clamp(Math.max(1, agl / 250), 1, 10);
+  const shStrength = shadows.enabled ? (1 - smooth(agl, 3000, 8000)) * smooth(sunUp, -0.03, 0.05) : 0;
+  world.keepRadius = shStrength > 0 ? Math.min(900, shadows.extent(shScale)) : 0;
+  const pos = mode === 'fly' ? flight.lat : mode === 'chute' ? diver.lat : walker.lat;
+  const lon = currentLon();
+  const m = llToMerc(pos, lon);
+  world.update(camera, camPos, renderer.domElement.height / renderer.getPixelRatio(), m.u, m.v);
+
+  // --- render ---
+  skyLUT.render(renderer, camAlt, sunUp);
+  shadows.render(renderer, scene, camPos, env.sun, shScale, shStrength);
+  const bloomAmt = nightF * (1 - smooth(camAlt, 15000, 30000));
+  if (bloomAmt > 0.02) {
+    shared.uOutHDR.value = 1;
+    bloom.render(renderer, scene, camera, bloomAmt, shared.uTime.value);
+    shared.uOutHDR.value = 0;
+  } else {
+    renderer.render(scene, camera);
+  }
+  updateHud(dt, agl);
+}
+frame();
+
+window.__earth = {
+  flight, walker, diver, world, camera, spawn, startOnFoot, PRESETS, WALK_PRESETS, sky, env, shared, atmosphere, shadows, renderer,
+  get mode() { return mode; },
+  get settle() { return settle; },
+  get tod() { return tod; },
+  setSunLon: (v) => { sunLon = v; },
+  setHour: (h) => { sunLon = sunLonFor(currentLon(), h); },
+  setDayRate: (v) => { dayRate = v; },
+  setPaused: (v) => toggleMenu(v),
+  startChute,
+  exitPlane, boardPlane, parkPlaneAhead,
+};

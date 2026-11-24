@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voxel Earth Flight</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+
+    <div id="hud">
+      <div class="panel" id="stats">
+        <div><span>Speed</span><b id="h-speed">0</b></div>
+        <div><span>Altitude</span><b id="h-alt">0</b></div>
+        <div><span>Above ground</span><b id="h-agl">0</b></div>
+        <div><span>Position</span><b id="h-pos">–</b></div>
+        <div><span>Heading</span><b id="h-hdg">–</b></div>
+        <div><span>Local time</span><b id="h-time">–</b></div>
+        <div class="thr"><span>Throttle</span><i><em id="h-thr"></em></i></div>
+      </div>
+      <div class="panel" id="net">
+        <div id="h-tiles">loading…</div>
+        <div id="h-net">0 MB streamed</div>
+      </div>
+      <div id="h-warn">TERRAIN</div>
+      <div id="prompt"></div>
+      <div id="crosshair"></div>
+      <div class="panel hidden" id="help">
+        <b>Flight</b> W/S pitch · A/D roll · Q/E yaw · Shift/Ctrl throttle (0 to stop) · wheel<br />
+        <b>Landing</b> throttle to zero on a flat spot, wheels roll, then <b>Enter</b> to step out<br />
+        <b>On foot</b> click to look · WASD move · Shift sprint · Space jump · <b>Enter</b> board plane (when close) · P call plane<br />
+        <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: WASD steer · <b>Space</b> open parachute · canopy: WASD steer, S flare to land<br />
+        <b>Camera</b> C chase/cockpit · <b>Time</b> [ ] shift, T pause/resume day cycle (see menu)<br />
+        <b>Other</b> G go to place · I invert pitch · L auto-level · H show/hide these controls · Esc/M menu
+      </div>
+      <div class="attrib">
+        <b>H</b> controls · Terrain: AWS Terrain Tiles (Mapzen/NASA/USGS) · Buildings &amp; water: © OpenStreetMap contributors via OpenFreeMap ·
+        Imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community
+      </div>
+    </div>
+
+    <div id="search" class="panel">
+      <input id="search-input" placeholder="Fly to… (city, landmark, address)" />
+      <div id="search-status"></div>
+    </div>
+
+    <div id="menu" class="open">
+      <div class="card">
+        <h1>Voxel Earth</h1>
+        <p>
+          Fly a plane over the whole planet, rebuilt as voxels, land it and explore on foot. Terrain, imagery,
+          buildings and water are streamed tile-by-tile as you go.
+        </p>
+        <h2>Fly over</h2>
+        <div id="presets"></div>
+        <h2>Walk around</h2>
+        <div id="walk-presets"></div>
+        <div class="row">
+          <input id="menu-search" placeholder="…or search any place" />
+          <button id="menu-search-go">Go</button>
+        </div>
+        <div id="menu-status"></div>
+        <div class="row">
+          <label>Day cycle <select id="daycycle"></select></label>
+          <label class="grow">Time <input type="range" id="tod" min="0" max="24" step="0.05" /> <span id="tod-label">12:00</span></label>
+        </div>
+        <div class="row">
+          <label>Detail <select id="quality"></select></label>
+          <label><input type="checkbox" id="shadows" checked /> Shadows</label>
+          <button id="resume" class="primary">Resume</button>
+        </div>
+        <p class="small">
+          W/S pitch · A/D roll · Q/E yaw · Shift/Ctrl throttle · Enter exit/board plane · J jump with parachute · C camera · G search · Esc menu
+        </p>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
