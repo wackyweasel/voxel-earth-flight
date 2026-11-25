@@ -33,6 +33,22 @@ export const shared = {
   uShExt: { value: new THREE.Vector3(50, 200, 800) },
   uShRange: { value: new THREE.Vector3(3000, 3000, 3000) },
   uShSize: { value: 2048 },
+  // weather (driven by weather.js)
+  uOvercast: { value: 0 }, // 0..1: flat, cloud-filtered lighting
+  uStorm: { value: 0 }, // 0..1: dark, heavy cloud
+  uWet: { value: 0 }, // surface wetness
+  uSnow: { value: 0 }, // snow cover
+  uRain: { value: 0 }, // rain intensity (water ripples)
+  uFogD: { value: 0 }, // ground fog density per metre at fog base
+  uFogH: { value: 300 }, // ground fog scale height
+  uFogBase: { value: 0 }, // altitude the fog layer sits on
+  uFogIn: { value: 0 }, // uniform fog density while inside a cloud
+  uFlash: { value: 0 }, // lightning illumination
+  uFlashDir: { value: new THREE.Vector3(0, 1, 0) },
+  uCloudLo: { value: 0.51 }, // coverage threshold: lower means more cloud
+  uCloudH: { value: 2500 }, // cloud base altitude
+  uCloudT: { value: 300 }, // cloud layer thickness
+  uCloudExt: { value: 0.006 }, // cloud extinction per metre
 };
 
 export const KIND = { terrain: 0, wall: 1, roof: 2, water: 3, tree: 4, road: 5, plane: 6, lattice: 7 };
@@ -42,7 +58,7 @@ const LUT_H = 128;
 const R_KM = R / 1000;
 
 // Atmosphere helpers shared by the voxel and sky fragment shaders.
-const ATM_COMMON = /* glsl */ `
+export const ATM_COMMON = /* glsl */ `
   uniform sampler2D uSkyLUT;
   uniform vec3 uSun;
   uniform vec3 uMoon;
@@ -52,6 +68,15 @@ const ATM_COMMON = /* glsl */ `
   uniform float uHaze;
   uniform float uSunI;
   uniform float uAmbient;
+  uniform float uOvercast;
+  uniform float uStorm;
+  uniform float uFlash;
+  uniform vec3 uFlashDir;
+  uniform float uFogD;
+  uniform float uFogH;
+  uniform float uFogBase;
+  uniform float uFogIn;
+  uniform float uSkyGain;
   const float PI = 3.14159265;
   const vec3 BETA_R = vec3(5.8e-3, 13.5e-3, 33.1e-3);
   const float BETA_M_EXT = 4.44e-3;
@@ -82,7 +107,25 @@ const ATM_COMMON = /* glsl */ `
     float tw = exp(-pow((mu - 0.02) / 0.13, 2.0));
     vec3 hi = (zen * day + vec3(0.36, 0.17, 0.16) * tw * 0.5) * uAmbient + vec3(0.02, 0.028, 0.055);
     vec3 lo = hi * vec3(0.50, 0.47, 0.42) + vec3(0.8, 0.7, 0.55) * max(mu, 0.0) * 0.06 * uAmbient;
-    return mix(lo, hi, clamp(0.5 + 0.5 * nUp, 0.0, 1.0));
+    // under cloud the light is flatter, greyer and darker in a storm
+    vec3 r = mix(lo, hi, mix(clamp(0.5 + 0.5 * nUp, 0.0, 1.0), 0.72, uOvercast * 0.7));
+    r = mix(r, vec3(dot(r, vec3(0.3, 0.55, 0.15))), uOvercast * 0.6);
+    return r * (1.0 + 0.9 * uOvercast) * (1.0 - 0.5 * uStorm);
+  }
+
+  // Colour of the air in fog and under a cloud deck: the clear sky's brightness, desaturated.
+  vec3 hazeColor() {
+    vec3 s = skyLookup(normalize(uUpC * 0.7 + uSunH * 0.7)).rgb * uSkyGain;
+    float L = dot(s, vec3(0.3, 0.55, 0.15));
+    vec3 g = vec3(L) * vec3(1.0, 1.02, 1.07) * (1.0 + 0.2 * uOvercast) * (1.0 - 0.6 * uStorm);
+    return mix(s, g, clamp(0.35 + 0.65 * uOvercast, 0.0, 1.0)) + vec3(0.5, 0.58, 0.85) * uFlash * 0.7;
+  }
+
+  // Sky colour in direction d, greyed out under cloud cover.
+  vec3 skyView(vec3 d) {
+    vec3 c = skyLookup(d).rgb * uSkyGain;
+    if (uOvercast < 0.01) return c;
+    return mix(c, hazeColor() * (0.85 + 0.3 * clamp(dot(d, uUpC), 0.0, 1.0)), uOvercast * 0.92);
   }
 
   // Full moon opposite the sun: cool light, no shadows.
@@ -102,6 +145,19 @@ const ATM_COMMON = /* glsl */ `
     vec2 f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
     return mix(mix(hash12(i), hash12(i + vec2(1, 0)), f.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), f.x), f.y);
+  }
+
+  // Gradient of expanding rain rings, one ring per grid cell.
+  vec2 rainRipples(vec2 p, float t) {
+    vec2 cell = floor(p);
+    vec2 f = fract(p);
+    float ph = fract(t * 0.9 + hash12(cell));
+    vec2 c = vec2(0.3 + 0.4 * hash12(cell + 3.1), 0.3 + 0.4 * hash12(cell + 9.7));
+    vec2 d = f - c;
+    float r = length(d);
+    float rad = ph * 0.3;
+    float ring = sin((r - rad) * 60.0) * exp(-pow((r - rad) * 18.0, 2.0)) * (1.0 - ph);
+    return d / (r + 1e-4) * ring * step(hash12(cell + 1.3), 0.8);
   }
 
   vec3 acesTone(vec3 x) {
@@ -148,13 +204,15 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
       #include <logdepthbuf_pars_fragment>
       ${ATM_COMMON}
       uniform vec3 uCamPos;
-      uniform float uSkyGain;
       uniform float uExposure;
       uniform float uOutHDR;
       uniform float uTime;
       uniform float uCamAlt;
       uniform float uUseTrue;
       uniform float uShadowOn;
+      uniform float uWet;
+      uniform float uSnow;
+      uniform float uRain;
       uniform sampler2D uSh0;
       uniform sampler2D uSh1;
       uniform sampler2D uSh2;
@@ -263,12 +321,14 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
           vec3 t2 = cross(up, t1);
           vec2 w = vWuv * 0.33 + vec2(uTime * 0.31, uTime * 0.17);
           vec2 g = vec2(vnoise2(w + vec2(1.7, 9.2)), vnoise2(w * 1.9 + vec2(8.3, 2.8) + uTime * 0.2)) - 0.5;
+          g *= 1.0 + 1.2 * uStorm + 0.5 * uRain;
+          if (uRain > 0.01) g += rainRipples(vWuv * 1.2, uTime) * uRain * 0.7 * (1.0 - smoothstep(4.0, 40.0, fp));
           float amp = 0.5 * (1.0 - smoothstep(6.0, 60.0, fp));
           vec3 nw = normalize(up + (t1 * g.x + t2 * g.y) * amp);
           vec3 rd = reflect(-V, nw);
           float NoV = clamp(dot(nw, V), 0.0, 1.0);
           float fres = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);
-          vec3 refl = skyLookup(skyDir(rd)).rgb * uSkyGain;
+          vec3 refl = skyView(skyDir(rd));
           vec3 body = alb * (amb + sunRad * max(dot(up, uSun), 0.0) * 0.25);
           float glint = pow(max(dot(rd, uSun), 0.0), 700.0) * 40.0;
           col = mix(body, refl, fres) + sunRad * glint;
@@ -286,25 +346,57 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
             alb *= 1.0 - 0.1 * seam * (1.0 - smoothstep(0.4, 1.5, fp));
           }
 
+          float upN = dot(n, up);
+          float snowCov = 0.0;
+          float wetRefl = 0.0;
+          float pud = 0.0;
+          if (uSnow > 0.001 && (kind == 0.0 || kind == 2.0 || kind == 4.0 || kind == 5.0)) {
+            float sn = vnoise2(vWuv * 0.9) * 0.6 + vnoise2(vWuv * 0.23 + 5.0) * 0.4;
+            float thin = kind == 5.0 ? 0.5 : (kind == 4.0 ? 0.2 : 0.0);
+            snowCov = smoothstep(0.5, 0.85, upN) * clamp(uSnow * 1.5 - thin + (sn - 0.5) * 0.7, 0.0, 1.0);
+            alb = mix(alb, vec3(0.80, 0.85, 0.93), snowCov);
+          }
+          if (uWet > 0.001 && (kind == 0.0 || kind == 2.0 || kind == 5.0 || kind == 4.0)) {
+            pud = smoothstep(0.5, 0.72, vnoise2(vWuv * 0.11 + 3.0) * 0.7 + vnoise2(vWuv * 0.4) * 0.3);
+            float wa = uWet * (kind == 5.0 ? 1.0 : (kind == 2.0 ? 0.85 : 0.5)) * (1.0 - snowCov);
+            alb *= 1.0 - (0.3 + 0.2 * pud) * wa;
+            wetRefl = wa * smoothstep(0.5, 0.9, upN);
+          }
+
           float aoD = mix(0.55, 1.0, ao);
           // the sun-coloured fill stands in for light bounced between buildings
           col = alb * (sunRad * NoL * sh * aoD + amb * ao + sunRad * 0.09 * mix(0.35, 1.0, ao));
           col += alb * moonC * (NoM * aoD + 0.3 * ao);
+          if (uFlash > 0.001) col += alb * vec3(0.55, 0.65, 1.0) * uFlash * 1.6 * (0.35 + 0.65 * max(dot(n, uFlashDir), 0.0)) * ao;
+          if (wetRefl > 0.0) {
+            // wet surfaces mirror the sky at grazing angles, puddles most of all
+            vec3 rdw = reflect(-V, n);
+            float nv = clamp(dot(n, V), 0.0, 1.0);
+            float rf = clamp(wetRefl * (0.05 + 0.95 * pow(1.0 - nv, 4.0)) * (0.5 + 0.9 * pud) + wetRefl * pud * 0.18, 0.0, 0.85);
+            col = mix(col, skyView(skyDir(rdw)) * 0.9, rf);
+            col += sunRad * pow(max(dot(rdw, uSun), 0.0), 200.0) * 4.0 * wetRefl * sh;
+          }
 
           if (kind == 5.0 && night > 0.01) {
-            // street lamps: soft warm pools scattered over the roads; averaged out when seen from far away
+            // street lamps: a tight bright core inside a broad soft halo, each fading to its mean when seen from far away
             vec2 lc = vWuv / 26.0;
             vec2 li = floor(lc);
-            float lamp = 0.0;
+            float core = 0.0;
+            float halo = 0.0;
             for (int a = -1; a <= 1; a++) {
               for (int b = -1; b <= 1; b++) {
                 vec2 c = li + vec2(float(a), float(b));
                 vec2 dp = (lc - c - vec2(hash12(c * 1.7 + 3.1), hash12(c * 2.3 + 7.7))) * 26.0;
-                lamp += exp(-dot(dp, dp) / 50.0);
+                float d2 = dot(dp, dp);
+                core += exp(-d2 / 40.0);
+                halo += exp(-d2 / 140.0);
               }
             }
-            lamp = mix(lamp, 0.3, smoothstep(2.0, 12.0, fp));
-            col += (alb * 0.7 + 0.04) * vec3(1.0, 0.72, 0.42) * lamp * 3.0 * night;
+            core = mix(core, 0.186, smoothstep(1.5, 8.0, fp));
+            halo = mix(halo, 0.65, smoothstep(6.0, 30.0, fp));
+            float lamp = 0.65 * core + 0.35 * halo;
+            float lumA = dot(alb, vec3(0.3, 0.55, 0.15));
+            col += (lumA * 0.45 + alb * 0.1 + 0.05) * vec3(1.0, 0.72, 0.42) * lamp * 3.0 * night;
           }
 
           if (kind == 1.0) {
@@ -326,7 +418,7 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
             float NoV = clamp(dot(n, V), 0.0, 1.0);
             float fres = mix(0.10, 1.0, pow(1.0 - NoV, 4.0));
             vec3 rd = reflect(-V, n);
-            vec3 refl = skyLookup(skyDir(rd)).rgb * uSkyGain;
+            vec3 refl = skyView(skyDir(rd));
             float glint = pow(max(dot(rd, uSun), 0.0), 120.0) * 6.0 * sh;
             vec3 glass = refl * fres * 0.7 + alb * 0.05 * amb + sunRad * glint;
             float day = smoothstep(-0.14, 0.1, mu);
@@ -367,11 +459,21 @@ export function createVoxelMaterial(side = THREE.FrontSide, fade = false) {
         float eh = max(s, 0.015);
         vec3 hz = dirV - uUpC * s;
         hz = normalize(hz + vec3(1e-6)) * sqrt(1.0 - eh * eh) + uUpC * eh;
-        vec3 Lh = skyLookup(hz).rgb * uSkyGain;
+        vec3 Lh = skyView(hz);
         vec3 colH = col * T + Lh * (1.0 - T);
         vec4 lut = skyLookup(dirV);
         vec3 colT = col * lut.a + lut.rgb * uSkyGain;
         col = mix(colH, colT, uUseTrue);
+
+        if (uFogD > 0.0 || uFogIn > 0.0) {
+          // exponential height fog: average density along the view ray, plus uniform fog inside a cloud
+          float hcb = max(hc - uFogBase, 0.0);
+          float hfb = max(vAlt - uFogBase, 0.0);
+          float dhb = hfb - hcb;
+          float kf = abs(dhb) > 0.5 ? uFogH * (exp(-hcb / uFogH) - exp(-hfb / uFogH)) / dhb : exp(-hcb / uFogH);
+          float ftau = (uFogD * kf + uFogIn) * dist;
+          col = mix(hazeColor(), col, exp(-ftau));
+        }
 
         col *= uExposure;
         if (uOutHDR > 0.5) {
@@ -638,13 +740,15 @@ export function createSky() {
       uniform mat4 uInvProj;
       uniform mat4 uCamWorld;
       uniform vec3 uCamPos;
-      uniform float uSkyGain;
       uniform float uExposure;
       uniform float uOutHDR;
       uniform float uTime;
       uniform float uCamAlt;
       uniform float uSpace;
       uniform float uCloud;
+      uniform float uCloudLo;
+      uniform float uCloudH;
+      uniform float uCloudT;
 
       float hash13(vec3 p3) {
         p3 = fract(p3 * 0.1031);
@@ -678,11 +782,21 @@ export function createSky() {
 
         vec4 lut = skyLookup(dir);
         vec3 sky = lut.rgb * uSkyGain * (1.0 - uSpace);
+        float cloudA = 0.0;
 
-        // clouds: a single world-fixed layer at 2.5 km, only seen from below it
+        // overcast greys the whole dome, fog thickens the horizon
+        float grey = uOvercast * uCloud * (1.0 - uSpace);
+        if (grey > 0.001) sky = mix(sky, hazeColor() * (0.9 + 0.35 * smoothstep(0.0, 0.8, max(el, 0.0))), grey * 0.9);
+        if (uFogD > 0.0 && uSpace < 1.0) {
+          float fogTop = exp(-max(uCamAlt - uFogBase, 0.0) / uFogH);
+          float fa = (1.0 - exp(-uFogD * 12000.0)) * fogTop * (1.0 - smoothstep(0.0, 0.1 + 0.3 * uFogH / 600.0, max(el, 0.0)));
+          sky = mix(sky, hazeColor(), fa);
+        }
+
+        // clouds: one world-fixed layer, only seen from below it
         if (uCloud > 0.001) {
           const float Rm = ${R}.0;
-          const float Hc = 2500.0;
+          float Hc = uCloudH;
           // flat control flow keeps texture derivatives valid, so mip selection stays smooth at the horizon
           float elc = max(el, 0.02);
           float rc = Rm + uCamAlt;
@@ -693,27 +807,43 @@ export function createSky() {
           vec3 dirc = normalize(dir + uUpC * (elc - el));
           vec3 P = uCloudO + dirc * t;
           float dn = cloudField(P);
-          float cov = smoothstep(0.51, 0.66, dn);
+          float cov = smoothstep(uCloudLo, uCloudLo + 0.15, dn);
+          cov = mix(cov, 1.0, uOvercast * uOvercast);
+          float th = smoothstep(0.25, 0.8, dn);
+          float dt2 = texture(uNoise, P * (1.0 / 1500.0) + 0.71).g;
           float a = cov * smoothstep(0.0, 0.12, el) * uCloud * 0.96;
           // one tap towards the sun gives self-shadowing, a second tap bright rims where the cloud thins out
-          float occ = smoothstep(0.51, 0.66, cloudField(P + uSun * 500.0));
+          float occ = mix(smoothstep(uCloudLo, uCloudLo + 0.15, cloudField(P + uSun * 500.0)), 1.0, uOvercast);
           vec3 up = normalize(uCamPos + dirc * t);
           vec3 sT = sunTransmit(dot(up, uSun), Hc) * uSunI;
           float fwd = pow(max(sd, 0.0), 6.0);
           float rim = (1.0 - cov) * cov * 4.0;
           vec3 cc = vec3(0.93, 0.95, 1.0) * (sT * (0.5 * (1.0 - 0.8 * occ) + 0.6 * fwd * rim) + skyAmbient(mu, 1.0) * (1.1 + 0.4 * (1.0 - cov))) * 0.8;
+          // thick cloud is dark underneath, storm cloud most of all
+          cc *= 1.0 - (0.45 * uOvercast + 0.45 * uStorm) * (0.15 + 0.85 * th);
+          cc *= mix(1.0, 0.7 + 0.6 * dt2, 0.4 + 0.5 * uOvercast);
+          cc += vec3(0.55, 0.62, 1.0) * uFlash * (0.3 + 2.0 * pow(max(dot(dir, uFlashDir), 0.0), 6.0));
           vec3 hz = skyLookup(normalize(dir - uUpC * el + uUpC * 0.02)).rgb * uSkyGain;
-          cc = mix(cc, hz, 1.0 - exp(-t / 90000.0));
+          hz = mix(hz, hazeColor(), uOvercast * 0.9);
+          cc = mix(cc, hz, 1.0 - exp(-t / mix(90000.0, 25000.0, uOvercast)));
           sky = mix(sky, cc, a);
+          cloudA = a;
+        }
+        // inside the cloud layer everything is white-out
+        float inC = clamp(uFogIn * 150.0, 0.0, 1.0);
+        if (inC > 0.001) {
+          sky = mix(sky, hazeColor(), inC);
+          cloudA = max(cloudA, inC);
         }
 
         vec3 col = sky;
+        float skyKeep = (1.0 - cloudA) * (1.0 - 0.7 * uOvercast);
         float nightS = 1.0 - smoothstep(-0.2, 0.0, mu);
         float md = dot(dir, uMoon);
         float moonVis = smoothstep(-0.08, 0.1, dot(uUpC, uMoon)) * (1.0 - uSpace);
         // faint airglow near the horizon and a soft halo around the moon
         col += vec3(0.004, 0.007, 0.016) * nightS * (1.0 + 2.5 * pow(1.0 - abs(el), 4.0)) * (1.0 - uSpace);
-        col += vec3(0.45, 0.58, 1.0) * (pow(max(md, 0.0), 90.0) * 0.05 + pow(max(md, 0.0), 12.0) * 0.004) * nightS * moonVis;
+        col += vec3(0.45, 0.58, 1.0) * (pow(max(md, 0.0), 90.0) * 0.05 + pow(max(md, 0.0), 12.0) * 0.004) * nightS * moonVis * skyKeep;
         // stars, hidden by any bright sky
         vec3 q = dir * 260.0;
         vec3 id = floor(q);
@@ -721,10 +851,10 @@ export function createSky() {
         float d = length(fract(q) - 0.5);
         float star = step(0.992, h) * smoothstep(0.32, 0.05, d) * (0.4 + 0.6 * hash13(id + 3.1));
         float skyL = dot(col, vec3(0.3, 0.6, 0.1)) * uExposure;
-        col += vec3(star) * lut.a * clamp(1.0 - skyL * 12.0, 0.0, 1.0) * 1.5;
+        col += vec3(star) * lut.a * clamp(1.0 - skyL * 12.0, 0.0, 1.0) * 1.5 * skyKeep;
 
         // sun disc
-        float sunT = skyLookup(uSun).a * step(-0.04, mu);
+        float sunT = skyLookup(uSun).a * step(-0.04, mu) * skyKeep;
         col += vec3(1.0, 0.92, 0.80) * smoothstep(0.99999, 0.999995, sd) * 60.0 * sunT;
 
         // moon disc with a few shaded maria
@@ -735,7 +865,7 @@ export function createSky() {
           float maria = vnoise3(vec3(mp * 2.6, 3.3)) * 0.6 + vnoise3(vec3(mp * 7.0, 9.1)) * 0.4;
           float lum = 0.55 + 0.45 * smoothstep(0.35, 0.65, maria);
           float disc = smoothstep(0.99994, 0.999955, md);
-          col = mix(col, vec3(0.80, 0.84, 0.92) * lum * 1.5, disc * moonVis * skyLookup(uMoon).a);
+          col = mix(col, vec3(0.80, 0.84, 0.92) * lum * 1.5, disc * moonVis * skyLookup(uMoon).a * skyKeep);
         }
 
         gl_FragColor = vec4(col, 1.0);
@@ -747,6 +877,7 @@ export function createSky() {
   mesh.frustumCulled = false;
   mesh.renderOrder = -1000;
   mesh.layers.set(1);
+  mesh.userData.noise = mat.uniforms.uNoise.value;
   return mesh;
 }
 

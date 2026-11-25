@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { R, llToDir, llToMerc, dirToLat, dirToLon } from './geo.js';
 import { Flight } from './flight.js';
+import { AutoPlay } from './autoplay.js';
 import { World } from './world.js';
 import { createAircraft } from './models.js';
 import { AIRCRAFT, AIRCRAFT_IDS } from './aircraft.js';
@@ -9,7 +10,8 @@ import { Skydiver, HIP } from './skydiver.js';
 import { Effects } from './effects.js';
 import { Shadows } from './shadows.js';
 import { Bloom } from './bloom.js';
-import { env, shared, createVoxelMaterial, createSky, createAtmosphere, createSkyLUT, CLOUD_PERIOD } from './materials.js';
+import { env, shared, createVoxelMaterial, createSky, createAtmosphere, createSkyLUT } from './materials.js';
+import { Weather, WEATHER_NAMES, DEFAULT_WEATHER } from './weather.js';
 import { touch, initTouch, setMode as setTouchMode, setAction as setTouchAction, setThrottleDisplay, setSprint, takeLook, TOUCH_DEVICE } from './touch.js';
 
 const PRESETS = [
@@ -60,6 +62,19 @@ const shadows = new Shadows();
 const bloom = new Bloom();
 const sky = createSky();
 scene.add(sky);
+const weather = new Weather(scene, sky);
+const _wf = new THREE.Vector3();
+let savedWeather = DEFAULT_WEATHER;
+let savedSound = true;
+try {
+  const w = localStorage.getItem('weather');
+  if (WEATHER_NAMES.includes(w)) savedWeather = w;
+  savedSound = localStorage.getItem('weatherSound') !== '0';
+} catch (e) {
+  // storage can be blocked; keep the defaults
+}
+weather.set(savedWeather, true);
+weather.setSound(savedSound);
 const atmosphere = createAtmosphere();
 scene.add(atmosphere);
 
@@ -155,7 +170,70 @@ function lockPointer() {
   if (!touch.enabled) canvas.requestPointerLock?.()?.catch?.(() => {});
 }
 
+// --- auto play ------------------------------------------------------------------------
+const auto = new AutoPlay(flight, {
+  ground: (dir) => {
+    const s = sampleAt(dir);
+    return s ? Math.max(s.h, 0) : null;
+  },
+  ready: () => world.ground.height !== null && world.ground.z >= 14,
+  arrive: (poi, hour) => {
+    sunLon = sunLonFor(poi.lon, hour);
+    tod = hour;
+    $('auto-title').classList.remove('on');
+    $('auto-tag').classList.remove('on');
+  },
+  title: (poi) => {
+    $('auto-place').textContent = poi.name;
+    $('auto-sub').textContent = poi.place;
+    $('auto-tag').textContent = `${poi.name} · ${poi.place}`;
+    $('auto-title').classList.add('on');
+    $('auto-tag').classList.add('on');
+    clearTimeout(autoTitleTimer);
+    autoTitleTimer = setTimeout(() => $('auto-title').classList.remove('on'), 8000);
+  },
+});
+let autoTitleTimer = 0;
+let autoFadeShown = 0;
+let autoIdleTimer = 0;
+
+function startAuto() {
+  applyAircraft();
+  hideCrash();
+  effects.clear();
+  diver.hide();
+  document.exitPointerLock?.();
+  mode = 'fly';
+  settle = null;
+  planeGone = false;
+  planeScale = 1;
+  lookYaw = lookPitch = 0;
+  document.body.classList.add('auto');
+  auto.start();
+}
+
+// handover: the player grabs the controls and keeps flying from where the plane is
+function stopAuto(handover) {
+  if (!auto.active) return;
+  auto.stop();
+  clearTimeout(autoTitleTimer);
+  document.body.classList.remove('auto', 'idle');
+  $('auto-title').classList.remove('on');
+  $('auto-tag').classList.remove('on');
+  $('auto-fade').style.opacity = 0;
+  autoFadeShown = 0;
+  if (handover) {
+    flight.throttle = flight.eng = flight.spec.trimThrottle;
+    flight.gHold = 0;
+    flight.spoil = 1;
+    flight.ele = flight.ail = flight.rud = flight.wp = flight.wq = flight.wr = 0;
+    lookYaw = lookPitch = 0;
+    camInit = false;
+  }
+}
+
 function spawn(p) {
+  stopAuto(false);
   applyAircraft();
   hideCrash();
   effects.clear();
@@ -212,6 +290,7 @@ function chooseAircraft(id) {
     // storage can be blocked
   }
   syncAircraftButtons();
+  if (auto.active) return applyAircraft();
   if (mode !== 'fly' && mode !== 'walk') return;
   const oldDrop = flight.spec.gearDrop;
   if (mode === 'walk' && (planeGone || settle)) return applyAircraft();
@@ -430,6 +509,8 @@ function sunDirection() {
 
 // --- input ---------------------------------------------------------------------
 const keys = new Set();
+const AUTO_TAKEOVER = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'Space']);
+const AUTO_IGNORED = new Set(['Enter', 'KeyJ', 'KeyP', 'KeyB']);
 const typing = () => document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.type !== 'checkbox';
 
 window.addEventListener('keydown', (e) => {
@@ -444,7 +525,18 @@ window.addEventListener('keydown', (e) => {
     toggleMenu();
     return;
   }
+  if (e.code === 'KeyV' && !e.repeat) {
+    if (auto.active) stopAuto(true);
+    else startAuto();
+    toggleMenu(false);
+    return;
+  }
   if (paused) return;
+  if (auto.active) {
+    if (e.code === 'KeyN') return auto.skip();
+    if (AUTO_IGNORED.has(e.code)) return;
+    if (AUTO_TAKEOVER.has(e.code)) stopAuto(true);
+  }
   keys.add(e.code);
   if (e.repeat) return;
   switch (e.code) {
@@ -607,10 +699,7 @@ function buildMenu() {
     const b = document.createElement('button');
     b.dataset.id = id;
     b.innerHTML = `${AIRCRAFT[id].name}<small>${AIRCRAFT[id].desc}</small>`;
-    b.onclick = () => {
-      chooseAircraft(id);
-      toggleMenu(false);
-    };
+    b.onclick = () => chooseAircraft(id);
     $('aircraft').appendChild(b);
   }
   syncAircraftButtons();
@@ -655,11 +744,42 @@ function buildMenu() {
     dayRate = DAY_CYCLES[dc.value];
     if (dayRate) lastRate = dayRate;
   };
+  const wsel = $('weather');
+  for (const name of WEATHER_NAMES) wsel.add(new Option(name, name, false, name === savedWeather));
+  wsel.onchange = () => {
+    weather.set(wsel.value);
+    try {
+      localStorage.setItem('weather', wsel.value);
+    } catch (e) {
+      // storage can be blocked
+    }
+  };
+  $('wsound').checked = savedSound;
+  $('wsound').onchange = (e) => {
+    weather.setSound(e.target.checked);
+    if (e.target.checked) weather.audio.unlock();
+    try {
+      localStorage.setItem('weatherSound', e.target.checked ? '1' : '0');
+    } catch (err) {
+      // storage can be blocked
+    }
+  };
   $('tod').oninput = (e) => {
     sunLon = sunLonFor(currentLon(), parseFloat(e.target.value));
     tod = localHour();
   };
   $('resume').onclick = () => toggleMenu(false);
+  $('auto-start').onclick = () => {
+    startAuto();
+    toggleMenu(false);
+  };
+  $('auto-take').onclick = () => stopAuto(true);
+  window.addEventListener('pointermove', () => {
+    if (!auto.active) return;
+    document.body.classList.remove('idle');
+    clearTimeout(autoIdleTimer);
+    autoIdleTimer = setTimeout(() => document.body.classList.add('idle'), 3000);
+  });
   $('menu-search-go').onclick = () => geocode($('menu-search').value, true);
   $('menu-search').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') geocode($('menu-search').value, true);
@@ -861,7 +981,8 @@ function frame() {
   const ground = world.ground.height;
   let agl;
   if (mode === 'fly') {
-    if (!paused) {
+    if (!paused && auto.active) auto.update(dt, planeScale);
+    else if (!paused) {
       flight.update(dt, readFlightInput(dt), planeScale, ground, flight.spec.gearDrop);
       if (flight.touchEvent) {
         const te = flight.touchEvent;
@@ -942,7 +1063,12 @@ function frame() {
 
   // --- camera rig ---
   flight.basisQuaternion(planeQuat);
-  if (mode === 'fly') {
+  if (mode === 'fly' && auto.active) {
+    camPos.copy(auto.camPos);
+    _q.copy(auto.camQuat);
+    camera.near = Math.max(0.3, 0.4 * s);
+    camera.fov = auto.fov;
+  } else if (mode === 'fly') {
     if (!camInit) {
       camQuat.copy(planeQuat);
       camInit = true;
@@ -988,7 +1114,7 @@ function frame() {
   camera.updateProjectionMatrix();
   camera.updateMatrixWorld();
 
-  plane.visible = !planeGone && mode !== 'crash' && (mode !== 'fly' || chase);
+  plane.visible = !planeGone && mode !== 'crash' && (mode !== 'fly' || (auto.active ? auto.planeVisible : chase));
   plane.position.copy(flight.p).sub(camPos);
   plane.quaternion.copy(planeQuat);
   plane.scale.setScalar(s);
@@ -1023,18 +1149,23 @@ function frame() {
   su.uInvProj.value.copy(camera.projectionMatrix).invert();
   su.uCamWorld.value.copy(camera.matrixWorld);
   su.uSpace.value = smooth(camAlt, 60000, 150000);
-  su.uCloud.value = 1 - smooth(camAlt, 1800, 2800);
-  {
-    const wt = (now - t0) / 1000;
-    const wrap = (v) => ((v % CLOUD_PERIOD) + CLOUD_PERIOD) % CLOUD_PERIOD;
-    su.uCloudO.value.set(wrap(camPos.x + wt * 5.0), wrap(camPos.y + wt * 1.5), wrap(camPos.z + wt * 3.0));
-  }
+  weather.update(dt, {
+    camPos,
+    camUp,
+    camAlt,
+    forward: _wf.set(0, 0, -1).applyQuaternion(camera.quaternion),
+    ground: world.ground.height,
+    groundAt,
+    paused,
+    fov: camera.fov,
+    height: renderer.domElement.height,
+  });
   atmosphere.position.copy(camPos).negate();
   atmosphere.material.uniforms.uFade.value = THREE.MathUtils.clamp((camAlt - 40000) / 150000, 0, 1);
 
   // --- stream world ---
   const shScale = THREE.MathUtils.clamp(Math.max(1, agl / 250), 1, 10);
-  const shStrength = shadows.enabled ? (1 - smooth(agl, 3000, 8000)) * smooth(sunUp, -0.03, 0.05) : 0;
+  const shStrength = shadows.enabled ? (1 - smooth(agl, 3000, 8000)) * smooth(sunUp, -0.03, 0.05) * (1 - weather.overcast) : 0;
   world.keepRadius = shStrength > 0 ? Math.min(900, shadows.extent(shScale)) : 0;
   const pos = mode === 'fly' ? flight.lat : mode === 'chute' ? diver.lat : mode === 'crash' ? crash.lat : walker.lat;
   const lon = currentLon();
@@ -1053,6 +1184,10 @@ function frame() {
     renderer.render(scene, camera);
   }
   updateHud(dt, agl);
+  if (auto.active && Math.abs(auto.fade - autoFadeShown) > 0.004) {
+    autoFadeShown = auto.fade;
+    $('auto-fade').style.opacity = autoFadeShown;
+  }
 }
 frame();
 
@@ -1067,5 +1202,5 @@ window.__earth = {
   setPaused: (v) => toggleMenu(v),
   startChute, touch, doAction, effects, startCrash,
   get crash() { return crash; },
-  exitPlane, boardPlane, parkPlaneAhead, chooseAircraft,
+  exitPlane, boardPlane, parkPlaneAhead, chooseAircraft, weather, auto, startAuto, stopAuto,
 };

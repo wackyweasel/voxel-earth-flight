@@ -39,6 +39,13 @@
           <small class="kbd-only">or press Enter</small>
         </div>
       </div>
+      <div id="auto-fade"></div>
+      <div id="auto-title">
+        <div id="auto-sub"></div>
+        <div id="auto-place"></div>
+      </div>
+      <div id="auto-tag"></div>
+      <button id="auto-take" type="button">Take control</button>
       <div class="panel hidden" id="help">
         <span class="kbd-only">
           <b>Flight</b> W/S pitch · A/D roll · Q/E rudder · Shift/Ctrl (or wheel) throttle · <b>Space</b> brake · drag the mouse to look around<br />
@@ -47,7 +54,7 @@
           <b>On foot</b> click to look · WASD move · Shift sprint · Space jump · <b>Enter</b> board plane (when close) · P call plane<br />
           <b>Skydive</b> <b>J</b> jump out of the plane (high up) · free-fall: A/D turn, W dive, S slow down · <b>Space</b> open the parachute (it auto-opens low down) · under canopy: A/D steer, W speed bar (faster), S brakes, hold <b>Space</b> to flare just above the ground for a soft landing · mouse looks around<br />
           <b>Camera</b> C chase/cockpit · <b>Time</b> [ ] shift, T pause/resume day cycle (see menu)<br />
-          <b>Other</b> G go to place · I invert pitch · L flight assist on/off · H show/hide these controls · Esc/M menu
+          <b>Other</b> G go to place · I invert pitch · L flight assist on/off · H show/hide these controls · Esc/M menu · <b>V</b> Auto Play on/off (N next place; any flight key takes over)
         </span>
         <span class="touch-only">
           <b>Flight</b> right stick: pitch &amp; roll · left lever: throttle · ◀ ▶ rudder · BRAKE on the ground · drag the sky to look around<br />
@@ -76,6 +83,9 @@
         </p>
         <h2>Aircraft</h2>
         <div id="aircraft"></div>
+        <button id="auto-start" class="primary wide" type="button">
+          Auto Play<small>Sit back: it tours the world's most beautiful places, with cinematic cameras. Press V any time.</small>
+        </button>
         <h2>Fly over</h2>
         <div id="presets"></div>
         <h2>Walk around</h2>
@@ -88,6 +98,10 @@
         <div class="row">
           <label>Day cycle <select id="daycycle"></select></label>
           <label class="grow">Time <input type="range" id="tod" min="0" max="24" step="0.05" /> <span id="tod-label">12:00</span></label>
+        </div>
+        <div class="row">
+          <label>Weather <select id="weather"></select></label>
+          <label><input type="checkbox" id="wsound" checked /> Weather sound</label>
         </div>
         <div class="row">
           <label>Detail <select id="quality"></select></label>
